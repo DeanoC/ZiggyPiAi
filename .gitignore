@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+build.zig.zon
+
+# Environment files and secrets
+.env
+.env.*
+code/auth.json
+auth.json
+
+# IDE/project files
+*.swp
+.DS_Store
