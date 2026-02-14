@@ -120,13 +120,13 @@ pub fn registerDefaultModels(registry: *ModelRegistry) !void {
     try registry.register(.{
         .id = "gpt-5.3-codex-spark",
         .name = "GPT-5.3 Codex Spark",
-        .api = "openai-codex-responses",
-        .provider = "openai-codex",
-        .base_url = "https://chatgpt.com/backend-api",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
         .reasoning = true,
-        .cost = .{ .input = 0.0, .output = 0.0 },
-        .context_window = 272_000,
-        .max_tokens = 128_000,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
     });
     try registry.register(.{
         .id = "k2p5",

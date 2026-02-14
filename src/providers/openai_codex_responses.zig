@@ -399,7 +399,7 @@ fn streamOpenAIResponsesBase(
 ) !void {
     const api_key = options.api_key orelse return error.MissingApiKey;
     const is_codox_endpoint = std.mem.endsWith(u8, endpoint, "/codex/responses");
-    const account_id = if (is_codox_endpoint) try extractCodexAccountId(allocator, api_key) else null;
+    const account_id = if (is_codox_endpoint) extractCodexAccountId(allocator, api_key) catch null else null;
     defer if (account_id) |aid| allocator.free(aid);
 
     var body = std.array_list.Managed(u8).init(allocator);
@@ -552,7 +552,8 @@ fn streamOpenAIResponsesBase(
                 try appendHeader(&request_headers, "chatgpt-account-id", account);
             }
             try appendHeader(&request_headers, "OpenAI-Beta", "responses=experimental");
-            try appendHeader(&request_headers, "originator", "pi");
+            const originator = if (std.mem.eql(u8, model.provider, "openai-codex-spark") or std.mem.eql(u8, model.id, "gpt-5.3-codex-spark")) "spark" else "pi";
+            try appendHeader(&request_headers, "originator", originator);
             if (options.session_id) |session_id| {
                 try appendHeader(&request_headers, "session_id", session_id);
             }

@@ -254,6 +254,12 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
             getCodexOauthApiKey(allocator) orelse
             std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
     }
+    if (std.mem.eql(u8, provider, "openai-codex-spark")) {
+        return std.process.getEnvVarOwned(allocator, "OPENAI_CODEX_SPARK_API_KEY") catch
+            std.process.getEnvVarOwned(allocator, "OPENAI_CODEX_API_KEY") catch
+            getCodexOauthApiKey(allocator) orelse
+            std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    }
     if (std.mem.eql(u8, provider, "anthropic"))
         return std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
     if (std.mem.eql(u8, provider, "kimi-coding") or std.mem.eql(u8, provider, "kimi-code")) {

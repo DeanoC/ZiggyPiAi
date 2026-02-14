@@ -22,6 +22,7 @@ const IntegrationServerArgs = struct {
     expected_message: []const u8,
     expected_response_message: []const u8,
     expected_model_id: []const u8,
+    expected_originator: ?[]const u8 = null,
 };
 
 fn readDotEnvKey(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
@@ -110,18 +111,30 @@ fn integrationServerWorker(args: *IntegrationServerArgs) void {
     var headers = mem.splitSequence(u8, request.head_buffer, "\r\n");
     _ = headers.next(); // Skip the request line.
     var found_auth = false;
+    var actual_originator: ?[]const u8 = null;
     while (headers.next()) |line| {
         if (line.len == 0) break;
         const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = mem.trim(u8, line[0..colon], " \t");
+        const value = mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(name, "authorization")) {
-            const value = mem.trim(u8, line[colon + 1 ..], " \t");
             assertRequestHeaderMatches(value, args.expected_api_key);
             found_auth = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "originator")) {
+            actual_originator = value;
         }
     }
     if (!found_auth) {
         std.debug.panic("missing Authorization header\n", .{});
+    }
+
+    if (args.expected_originator) |expected| {
+        if (actual_originator == null) {
+            std.debug.panic("missing originator header\n", .{});
+        }
+        if (!mem.eql(u8, actual_originator.?, expected)) {
+            std.debug.panic("originator header mismatch (got {s}, want {s})\n", .{ actual_originator.?, expected });
+        }
     }
 
     var body_buf: [4096]u8 = undefined;
@@ -270,6 +283,71 @@ test "openai responses integration" {
 
     try std.testing.expectEqualStrings(completed.text, server_response);
     try std.testing.expect(mem.eql(u8, completed.model, model.id));
+}
+
+test "codex spark originator integration" {
+    const allocator = std.testing.allocator;
+    const api_key = "test-spark-key";
+
+    const prompt = "integration test spark";
+    const server_response = "spark response";
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var server_value = try net.Address.listen(listen_addr, .{});
+    const port = server_value.listen_address.getPort();
+
+    const server_storage = try allocator.create(net.Server);
+    server_storage.* = server_value;
+    defer allocator.destroy(server_storage);
+
+    var server_ready = AtomicBool.init(false);
+    var server_ctx = IntegrationServerArgs{
+        .allocator = allocator,
+        .server = server_storage,
+        .ready = &server_ready,
+        .expected_api_key = api_key,
+        .expected_message = prompt,
+        .expected_response_message = server_response,
+        .expected_model_id = "gpt-5.3-codex-spark",
+        .expected_originator = "spark",
+    };
+
+    const server_thread = try Thread.spawn(.{}, integrationServerWorker, .{ &server_ctx });
+    defer server_thread.join();
+    while (!server_ready.load(.seq_cst)) {
+        _ = Thread.yield() catch {};
+    }
+
+    const base_url = try fmt.allocPrint(allocator, "http://127.0.0.1:{d}/codex", .{port});
+    defer allocator.free(base_url);
+
+    const model = types.Model{
+        .id = "gpt-5.3-codex-spark",
+        .name = "GPT-5.3 Codex Spark",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = base_url,
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    };
+
+    const user_message = types.Message{ .role = .user, .content = prompt };
+    var context_messages: [1]types.Message = .{ user_message };
+    const context = types.Context{ .messages = context_messages[0..] };
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try providers.registerBuiltInApiProviders(&registry);
+
+    var completed = try stream.completeSimpleByModel(allocator, &client, &registry, model, context, .{ .api_key = api_key });
+    defer stream.freeCompleteMessage(allocator, &completed);
+
+    try std.testing.expectEqualStrings(completed.text, server_response);
 }
 
 test "openai codex live smoke" {
