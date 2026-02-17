@@ -16,7 +16,8 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
             std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "anthropic"))
-        return std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
+        return std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN") catch
+            std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
     if (std.mem.eql(u8, provider, "kimi-coding") or std.mem.eql(u8, provider, "kimi-code")) {
         return std.process.getEnvVarOwned(allocator, "KIMICODE_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "KIMI_API_KEY") catch
@@ -25,10 +26,49 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
     if (std.mem.eql(u8, provider, "azure-openai-responses")) {
         return std.process.getEnvVarOwned(allocator, "AZURE_OPENAI_API_KEY") catch null;
     }
+    if (std.mem.eql(u8, provider, "github-copilot")) {
+        return std.process.getEnvVarOwned(allocator, "COPILOT_GITHUB_TOKEN") catch
+            std.process.getEnvVarOwned(allocator, "GH_TOKEN") catch
+            std.process.getEnvVarOwned(allocator, "GITHUB_TOKEN") catch null;
+    }
     if (std.mem.eql(u8, provider, "openrouter")) {
         return std.process.getEnvVarOwned(allocator, "OPENROUTER_API_KEY") catch null;
     }
+    if (std.mem.eql(u8, provider, "groq")) {
+        return std.process.getEnvVarOwned(allocator, "GROQ_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "cerebras")) {
+        return std.process.getEnvVarOwned(allocator, "CEREBRAS_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "xai")) {
+        return std.process.getEnvVarOwned(allocator, "XAI_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "zai")) {
+        return std.process.getEnvVarOwned(allocator, "ZAI_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "mistral")) {
+        return std.process.getEnvVarOwned(allocator, "MISTRAL_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "minimax")) {
+        return std.process.getEnvVarOwned(allocator, "MINIMAX_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "minimax-cn")) {
+        return std.process.getEnvVarOwned(allocator, "MINIMAX_CN_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "huggingface")) {
+        return std.process.getEnvVarOwned(allocator, "HF_TOKEN") catch null;
+    }
+    if (std.mem.eql(u8, provider, "vercel-ai-gateway")) {
+        return std.process.getEnvVarOwned(allocator, "AI_GATEWAY_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "opencode")) {
+        return std.process.getEnvVarOwned(allocator, "OPENCODE_API_KEY") catch null;
+    }
     if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-generative-ai") or std.mem.eql(u8, provider, "google-gemini-cli")) {
+        return std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
+            std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider, "google-antigravity")) {
         return std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
@@ -62,7 +102,19 @@ test "getEnvApiKey supports additional provider mappings" {
     const allocator = std.testing.allocator;
     const providers = [_][]const u8{
         "openrouter",
+        "groq",
+        "cerebras",
+        "xai",
+        "zai",
+        "mistral",
+        "minimax",
+        "minimax-cn",
+        "huggingface",
+        "vercel-ai-gateway",
+        "opencode",
+        "github-copilot",
         "google",
+        "google-antigravity",
         "google-generative-ai",
         "google-gemini-cli",
         "google-vertex",

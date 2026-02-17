@@ -43,6 +43,7 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Simple + full stream provider registration paths (`stream` and `stream_simple`)
 - Spark model coverage including `gpt-5.3-codex-spark` and `chatgpt5.3-spark` aliases in `src/models.zig`
 - Model registration parity generated from `pi-mono/packages/ai/src/models.generated.ts` for currently supported providers
+- Additional provider families from generated models now included when they map to implemented adapters (for example `openrouter`, `groq`, `cerebras`, `mistral`, `xai`, `zai`, `huggingface`, `minimax`, `minimax-cn`, `opencode`, `vercel-ai-gateway`, `github-copilot`)
 - Centralized OpenAI Codex OAuth flow (`src/oauth/openai_codex_oauth.zig`) used by env key resolution
 
 ### Not Yet Supported

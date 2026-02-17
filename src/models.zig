@@ -245,6 +245,10 @@ test "registerDefaultModels includes openai-codex variants" {
     const google_cli = registry.getModel("google-gemini-cli", "gemini-2.5-pro");
     const google_vertex = registry.getModel("google-vertex", "gemini-2.5-pro");
     const bedrock = registry.getModel("amazon-bedrock", "anthropic.claude-3-7-sonnet-20250219-v1:0");
+    const openrouter = registry.getModel("openrouter", "ai21/jamba-large-1.7");
+    const groq = registry.getModel("groq", "deepseek-r1-distill-llama-70b");
+    const minimax = registry.getModel("minimax", "MiniMax-M2");
+    const vercel_gateway = registry.getModel("vercel-ai-gateway", "alibaba/qwen-3-14b");
 
     try std.testing.expect(mini != null);
     try std.testing.expect(v5_1 != null);
@@ -256,6 +260,10 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(google_cli != null);
     try std.testing.expect(google_vertex != null);
     try std.testing.expect(bedrock != null);
+    try std.testing.expect(openrouter != null);
+    try std.testing.expect(groq != null);
+    try std.testing.expect(minimax != null);
+    try std.testing.expect(vercel_gateway != null);
     try std.testing.expect(std.mem.eql(u8, mini.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, v5_1.?.provider, "openai-codex"));
     try std.testing.expect(std.mem.eql(u8, v5_2.?.provider, "openai-codex"));
@@ -265,6 +273,10 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(std.mem.eql(u8, google_cli.?.api, "google-gemini-cli"));
     try std.testing.expect(std.mem.eql(u8, google_vertex.?.api, "google-vertex"));
     try std.testing.expect(std.mem.eql(u8, bedrock.?.api, "bedrock-converse-stream"));
+    try std.testing.expect(std.mem.eql(u8, openrouter.?.api, "openai-completions"));
+    try std.testing.expect(std.mem.eql(u8, groq.?.api, "openai-completions"));
+    try std.testing.expect(std.mem.eql(u8, minimax.?.api, "anthropic-messages"));
+    try std.testing.expect(std.mem.eql(u8, vercel_gateway.?.api, "anthropic-messages"));
 }
 
 test "supportsXhigh matches TS behavior" {

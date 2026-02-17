@@ -13,10 +13,23 @@ const supportedProviderKeys = new Set([
   'azure-openai-responses',
   'anthropic',
   'google',
+  'google-antigravity',
   'google-gemini-cli',
   'google-vertex',
   'amazon-bedrock',
   'kimi-coding',
+  'cerebras',
+  'github-copilot',
+  'groq',
+  'huggingface',
+  'minimax',
+  'minimax-cn',
+  'mistral',
+  'opencode',
+  'openrouter',
+  'vercel-ai-gateway',
+  'xai',
+  'zai',
 ]);
 
 const text = fs.readFileSync(tsPath, 'utf8');

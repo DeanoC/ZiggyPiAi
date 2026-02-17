@@ -48,5 +48,23 @@ require_in_file ".provider = \"openai-codex-spark\"" "$ZIG_MODELS_FILE" "Zig spa
 # Google provider parity aliases.
 require_in_file ".provider = \"google-gemini-cli\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated google-gemini-cli provider"
 require_in_file ".provider = \"google-vertex\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated google-vertex provider"
+require_in_file ".provider = \"google-antigravity\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated google-antigravity provider"
+
+# Additional provider parity families mapped to implemented APIs.
+for provider in \
+  "openrouter" \
+  "groq" \
+  "cerebras" \
+  "mistral" \
+  "huggingface" \
+  "xai" \
+  "zai" \
+  "minimax" \
+  "minimax-cn" \
+  "opencode" \
+  "vercel-ai-gateway"
+do
+  require_in_file ".provider = \"$provider\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated provider"
+done
 
 echo "model-sync: OK"
