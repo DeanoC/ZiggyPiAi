@@ -48,6 +48,22 @@ const GoogleCredentials = struct {
     project_id: ?[]const u8 = null,
 };
 
+fn jsonObjectStringField(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    keys: []const []const u8,
+) !?[]const u8 {
+    for (keys) |key| {
+        if (obj.get(key)) |value| {
+            if (value == .string and value.string.len > 0) {
+                const out = try allocator.dupe(u8, value.string);
+                return out;
+            }
+        }
+    }
+    return null;
+}
+
 fn parseGoogleCredentials(
     allocator: std.mem.Allocator,
     api_key_or_token: []const u8,
@@ -71,16 +87,13 @@ fn parseGoogleCredentials(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGoogleCredentials;
 
-    const token_v = parsed.value.object.get("token") orelse return error.InvalidGoogleCredentials;
-    if (token_v != .string or token_v.string.len == 0) return error.InvalidGoogleCredentials;
-
-    const project_id = if (parsed.value.object.get("projectId")) |project_v|
-        if (project_v == .string and project_v.string.len > 0) try allocator.dupe(u8, project_v.string) else null
-    else
-        null;
+    const token = (try jsonObjectStringField(allocator, parsed.value.object, &.{ "token", "access_token", "api_key" })) orelse
+        return error.InvalidGoogleCredentials;
+    errdefer allocator.free(token);
+    const project_id = try jsonObjectStringField(allocator, parsed.value.object, &.{ "projectId", "project_id" });
 
     return .{
-        .token = try allocator.dupe(u8, token_v.string),
+        .token = token,
         .project_id = project_id,
     };
 }
@@ -500,6 +513,15 @@ test "parse google credentials supports json token payload" {
     try std.testing.expectEqualStrings("ya29.test", creds.token);
     try std.testing.expect(creds.project_id != null);
     try std.testing.expectEqualStrings("my-project", creds.project_id.?);
+}
+
+test "parse google credentials supports oauth style field names" {
+    const allocator = std.testing.allocator;
+    var creds = try parseGoogleCredentials(allocator, "{\"access_token\":\"ya29.oauth\",\"project_id\":\"proj-123\"}");
+    defer deinitGoogleCredentials(allocator, &creds);
+    try std.testing.expectEqualStrings("ya29.oauth", creds.token);
+    try std.testing.expect(creds.project_id != null);
+    try std.testing.expectEqualStrings("proj-123", creds.project_id.?);
 }
 
 test "containsCaseInsensitive matches mixed case substrings" {
