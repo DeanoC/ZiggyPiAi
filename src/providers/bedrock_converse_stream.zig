@@ -215,6 +215,111 @@ fn loadAwsCredentialsFromContainer(
     };
 }
 
+fn isUnreservedUriByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    for (input) |c| {
+        if (isUnreservedUriByte(c)) {
+            try out.append(c);
+        } else {
+            const encoded = try std.fmt.allocPrint(allocator, "%{X:0>2}", .{c});
+            defer allocator.free(encoded);
+            for (encoded) |ec| try out.append(std.ascii.toUpper(ec));
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn extractXmlTagValue(allocator: std.mem.Allocator, xml: []const u8, tag: []const u8) !?[]const u8 {
+    const open = try std.fmt.allocPrint(allocator, "<{s}>", .{tag});
+    defer allocator.free(open);
+    const close = try std.fmt.allocPrint(allocator, "</{s}>", .{tag});
+    defer allocator.free(close);
+    const start = std.mem.indexOf(u8, xml, open) orelse return null;
+    const value_start = start + open.len;
+    const end = std.mem.indexOfPos(u8, xml, value_start, close) orelse return null;
+    const out = try allocator.dupe(u8, xml[value_start..end]);
+    return out;
+}
+
+fn loadAwsCredentialsFromWebIdentity(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+) !?AwsCredentialsOwned {
+    const token_file = std.process.getEnvVarOwned(allocator, "AWS_WEB_IDENTITY_TOKEN_FILE") catch null;
+    defer if (token_file) |v| allocator.free(v);
+    const role_arn = std.process.getEnvVarOwned(allocator, "AWS_ROLE_ARN") catch null;
+    defer if (role_arn) |v| allocator.free(v);
+    if (token_file == null or role_arn == null) return null;
+
+    const token_raw = std.fs.cwd().readFileAlloc(allocator, token_file.?, 1024 * 1024) catch return null;
+    defer allocator.free(token_raw);
+    const token_trimmed = std.mem.trim(u8, token_raw, " \t\r\n");
+    if (token_trimmed.len == 0) return null;
+
+    const role_session = std.process.getEnvVarOwned(allocator, "AWS_ROLE_SESSION_NAME") catch null;
+    defer if (role_session) |v| allocator.free(v);
+    const session_name = if (role_session) |name|
+        try allocator.dupe(u8, name)
+    else
+        try std.fmt.allocPrint(allocator, "ziggypiai-{d}", .{@as(u64, @intCast(std.time.timestamp()))});
+    defer allocator.free(session_name);
+
+    const encoded_role_arn = try urlEncode(allocator, role_arn.?);
+    defer allocator.free(encoded_role_arn);
+    const encoded_session_name = try urlEncode(allocator, session_name);
+    defer allocator.free(encoded_session_name);
+    const encoded_token = try urlEncode(allocator, token_trimmed);
+    defer allocator.free(encoded_token);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={s}&RoleSessionName={s}&WebIdentityToken={s}",
+        .{ encoded_role_arn, encoded_session_name, encoded_token },
+    );
+    defer allocator.free(body);
+
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try appendHeader(&headers, "content-type", "application/x-www-form-urlencoded");
+
+    var req = try client.request(.POST, try std.Uri.parse("https://sts.amazonaws.com/"), .{ .extra_headers = headers.items });
+    defer req.deinit();
+    const body_mut = try allocator.dupe(u8, body);
+    defer allocator.free(body_mut);
+    try req.sendBodyComplete(body_mut);
+
+    var redirect_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return null;
+
+    var response_buf = std.array_list.Managed(u8).init(allocator);
+    defer response_buf.deinit();
+    var transfer_buffer: [8192]u8 = undefined;
+    const response_reader = response.reader(&transfer_buffer);
+    try readAllResponseBody(response_reader, &response_buf);
+
+    const access = try extractXmlTagValue(allocator, response_buf.items, "AccessKeyId") orelse return null;
+    errdefer allocator.free(access);
+    const secret = try extractXmlTagValue(allocator, response_buf.items, "SecretAccessKey") orelse {
+        allocator.free(access);
+        return null;
+    };
+    errdefer allocator.free(secret);
+    const session = try extractXmlTagValue(allocator, response_buf.items, "SessionToken");
+
+    return .{
+        .access_key_id = access,
+        .secret_access_key = secret,
+        .session_token = session,
+        .region = null,
+    };
+}
+
 fn buildAmzDate(timestamp_secs: u64, amz_date: *[16]u8, date_stamp: *[8]u8) !void {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp_secs };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -748,6 +853,9 @@ pub fn streamBedrockConverseStream(
         shared_credentials = try loadAwsCredentialsFromProfile(allocator, aws_profile orelse "default");
         if (shared_credentials == null) {
             shared_credentials = try loadAwsCredentialsFromContainer(allocator, client);
+        }
+        if (shared_credentials == null) {
+            shared_credentials = try loadAwsCredentialsFromWebIdentity(allocator, client);
         }
     }
 

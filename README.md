@@ -45,6 +45,7 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Amazon Bedrock Converse (`bedrock-converse-stream`) via `src/providers/bedrock_converse_stream.zig`
   - Supports `AWS_BEARER_TOKEN_BEDROCK` bearer auth
   - Supports AWS IAM SigV4 signing via `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)
+  - Supports ECS/IRSA-style credential sourcing (`AWS_CONTAINER_CREDENTIALS_*`, `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`) for SigV4
   - Supports `AWS_BEDROCK_SKIP_AUTH=1` for proxy/gateway scenarios
 - Simple + full stream provider registration paths (`stream` and `stream_simple`)
 - Spark model coverage including `gpt-5.3-codex-spark` and `chatgpt5.3-spark` aliases in `src/models.zig`
