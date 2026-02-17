@@ -44,6 +44,7 @@ Initial Zig port of `pi-mono/packages/ai`.
   - `google-gemini-cli` / `google-antigravity`: Cloud Code Assist SSE endpoint with bearer auth (supports JSON credential payloads containing `token` + `projectId`)
   - `google-vertex`: Vertex REST SSE endpoint shape using project/location with bearer auth
   - `google-vertex` env resolution now mirrors ADC-style auth signaling (`GOOGLE_APPLICATION_CREDENTIALS` or default gcloud ADC file + project/location)
+  - `google-vertex` supports ADC `authorized_user` refresh flow and ADC `service_account` JWT-bearer exchange fallback
   - `google-gemini-cli` request headers now include Cloud Code metadata parity (`client-metadata`, `x-goog-api-client`) and pass `sessionId` when provided
 - Amazon Bedrock Converse (`bedrock-converse-stream`) via `src/providers/bedrock_converse_stream.zig`
   - Supports `AWS_BEARER_TOKEN_BEDROCK` bearer auth
@@ -56,14 +57,15 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Additional provider families from generated models now included when they map to implemented adapters (for example `openrouter`, `groq`, `cerebras`, `mistral`, `xai`, `zai`, `huggingface`, `minimax`, `minimax-cn`, `opencode`, `vercel-ai-gateway`, `github-copilot`)
 - Centralized OpenAI Codex OAuth flow (`src/oauth/openai_codex_oauth.zig`) used by env key resolution
 - Shared OAuth credential resolver (`src/oauth/provider_oauth.zig`) for `~/.pi/agent/auth.json` parity, including provider-specific token refresh and Google `{token, projectId}` API-key payload shaping
+- OAuth auth-file refresh locking + helper APIs for persistence (`savePiOAuthCredentials`, `removePiAuthProviderEntry`)
 - Interactive OAuth flow primitives for non-Codex providers (`src/oauth/provider_login_oauth.zig`): Anthropic auth-code flow, GitHub Copilot device flow, Google Gemini CLI/Antigravity auth-code flows, callback capture, and refresh helpers
 
 ### Not Yet Supported
 
-- Full Bedrock streaming event protocol parity (`converse-stream` chunk-by-chunk semantics) beyond current unified response mapping
 - Full provider parity for all pi-mono providers (only the providers listed in Supported are wired in Zig)
 - Complete schema-validation/util parity from TS utility modules
 - Full automatic project discovery/provisioning parity for Google OAuth login flows (helpers are present; callers still own project selection/persistence orchestration)
+- In-module pure Zig RSA signing path for Vertex service-account JWT exchange (current implementation shells out to `openssl`)
 
 ## Implemented in this milestone
 
@@ -89,3 +91,4 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Multi-provider support has progressed substantially, but full TS utility/schema parity is still pending.
 - Google Generative AI is available via direct REST streaming, including provider aliases used by model generation.
 - CI runs `zig build test`, targeted integration tests, and model sync checks via `.github/workflows/ci.yml`.
+- CI installs Zig directly from `ziglang.org` downloads in `.github/workflows/ci.yml` (action-based mirror setup was removed due upstream fetch failures).
