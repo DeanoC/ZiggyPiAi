@@ -59,6 +59,14 @@ const AdcAuthorizedUser = struct {
     quota_project_id: ?[]const u8 = null,
 };
 
+const AdcServiceAccount = struct {
+    client_email: []const u8,
+    private_key: []const u8,
+    token_uri: []const u8,
+    project_id: ?[]const u8 = null,
+    quota_project_id: ?[]const u8 = null,
+};
+
 fn jsonObjectStringField(
     allocator: std.mem.Allocator,
     obj: std.json.ObjectMap,
@@ -155,6 +163,14 @@ fn deinitAdcAuthorizedUser(allocator: std.mem.Allocator, adc: *AdcAuthorizedUser
     if (adc.quota_project_id) |p| allocator.free(p);
 }
 
+fn deinitAdcServiceAccount(allocator: std.mem.Allocator, adc: *AdcServiceAccount) void {
+    allocator.free(adc.client_email);
+    allocator.free(adc.private_key);
+    allocator.free(adc.token_uri);
+    if (adc.project_id) |p| allocator.free(p);
+    if (adc.quota_project_id) |p| allocator.free(p);
+}
+
 fn isUnreservedUriByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
 }
@@ -196,6 +212,153 @@ fn parseAuthorizedUserAdc(allocator: std.mem.Allocator, contents: []const u8) !?
         .client_secret = client_secret,
         .refresh_token = refresh_token,
         .quota_project_id = quota_project_id,
+    };
+}
+
+fn parseServiceAccountAdc(allocator: std.mem.Allocator, contents: []const u8) !?AdcServiceAccount {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+
+    const type_v = obj.get("type") orelse return null;
+    if (type_v != .string or !std.mem.eql(u8, type_v.string, "service_account")) return null;
+
+    const client_email = (try jsonObjectStringField(allocator, obj, &.{"client_email"})) orelse return null;
+    errdefer allocator.free(client_email);
+    const private_key = (try jsonObjectStringField(allocator, obj, &.{"private_key"})) orelse return null;
+    errdefer allocator.free(private_key);
+    const token_uri = (try jsonObjectStringField(allocator, obj, &.{"token_uri"})) orelse
+        try allocator.dupe(u8, "https://oauth2.googleapis.com/token");
+    errdefer allocator.free(token_uri);
+    const project_id = try jsonObjectStringField(allocator, obj, &.{"project_id"});
+    const quota_project_id = try jsonObjectStringField(allocator, obj, &.{"quota_project_id"});
+
+    return .{
+        .client_email = client_email,
+        .private_key = private_key,
+        .token_uri = token_uri,
+        .project_id = project_id,
+        .quota_project_id = quota_project_id,
+    };
+}
+
+fn base64UrlEncodeNoPad(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(input.len);
+    const out = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, input);
+    return out;
+}
+
+fn writeTempFile(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const u8, contents: []const u8) ![]u8 {
+    const rand_part = std.crypto.random.int(u64);
+    const path = try std.fmt.allocPrint(allocator, "/tmp/ziggypi-{s}-{d}{s}", .{ prefix, rand_part, suffix });
+    errdefer allocator.free(path);
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(contents);
+    return path;
+}
+
+fn signRs256WithOpenSsl(allocator: std.mem.Allocator, private_key_pem: []const u8, signing_input: []const u8) ![]u8 {
+    const key_path = try writeTempFile(allocator, "sa-key", ".pem", private_key_pem);
+    defer {
+        std.fs.deleteFileAbsolute(key_path) catch {};
+        allocator.free(key_path);
+    }
+    const input_path = try writeTempFile(allocator, "sa-jwt-input", ".txt", signing_input);
+    defer {
+        std.fs.deleteFileAbsolute(input_path) catch {};
+        allocator.free(input_path);
+    }
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "openssl", "dgst", "-sha256", "-sign", key_path, "-binary", input_path },
+        .max_output_bytes = 1024 * 1024,
+    }) catch return error.AdcTokenExchangeFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.AdcTokenExchangeFailed,
+        else => return error.AdcTokenExchangeFailed,
+    }
+
+    return allocator.dupe(u8, result.stdout);
+}
+
+fn exchangeServiceAccountToken(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    adc: AdcServiceAccount,
+) !GoogleCredentials {
+    const now_ts: i64 = @intCast(std.time.timestamp());
+    const header_json = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"iss\":\"{s}\",\"sub\":\"{s}\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"aud\":\"{s}\",\"iat\":{d},\"exp\":{d}}}",
+        .{ adc.client_email, adc.client_email, adc.token_uri, now_ts, now_ts + 3600 },
+    );
+    defer allocator.free(payload_json);
+
+    const encoded_header = try base64UrlEncodeNoPad(allocator, header_json);
+    defer allocator.free(encoded_header);
+    const encoded_payload = try base64UrlEncodeNoPad(allocator, payload_json);
+    defer allocator.free(encoded_payload);
+    const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ encoded_header, encoded_payload });
+    defer allocator.free(signing_input);
+
+    const signature = try signRs256WithOpenSsl(allocator, adc.private_key, signing_input);
+    defer allocator.free(signature);
+    const encoded_signature = try base64UrlEncodeNoPad(allocator, signature);
+    defer allocator.free(encoded_signature);
+    const assertion = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ signing_input, encoded_signature });
+    defer allocator.free(assertion);
+
+    const encoded_assertion = try urlEncode(allocator, assertion);
+    defer allocator.free(encoded_assertion);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={s}",
+        .{encoded_assertion},
+    );
+    defer allocator.free(body);
+
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try appendHeader(&headers, "content-type", "application/x-www-form-urlencoded");
+
+    var req = try client.request(.POST, try std.Uri.parse(adc.token_uri), .{ .extra_headers = headers.items });
+    defer req.deinit();
+    const body_mut = try allocator.dupe(u8, body);
+    defer allocator.free(body_mut);
+    try req.sendBodyComplete(body_mut);
+
+    var redirect_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return error.AdcTokenExchangeFailed;
+
+    var response_buf = std.array_list.Managed(u8).init(allocator);
+    defer response_buf.deinit();
+    var transfer_buffer: [8192]u8 = undefined;
+    const response_reader = response.reader(&transfer_buffer);
+    try readAllResponseBody(response_reader, &response_buf);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf.items, .{}) catch return error.AdcTokenExchangeFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AdcTokenExchangeFailed;
+    const token_v = parsed.value.object.get("access_token") orelse return error.AdcTokenExchangeFailed;
+    if (token_v != .string or token_v.string.len == 0) return error.AdcTokenExchangeFailed;
+
+    return .{
+        .token = try allocator.dupe(u8, token_v.string),
+        .project_id = if (adc.quota_project_id) |p|
+            try allocator.dupe(u8, p)
+        else if (adc.project_id) |p|
+            try allocator.dupe(u8, p)
+        else
+            null,
     };
 }
 
@@ -306,6 +469,13 @@ fn resolveVertexAdcCredentials(allocator: std.mem.Allocator, client: *std.http.C
                     deinitAdcAuthorizedUser(allocator, &a);
                 }
                 return try refreshVertexAdcToken(allocator, client, adc);
+            }
+            if (try parseServiceAccountAdc(allocator, contents)) |adc| {
+                defer {
+                    var a = adc;
+                    deinitAdcServiceAccount(allocator, &a);
+                }
+                return try exchangeServiceAccountToken(allocator, client, adc);
             }
         }
     }
@@ -766,6 +936,28 @@ test "parse authorized_user ADC rejects non-authorized_user types" {
     const allocator = std.testing.allocator;
     const adc_json = "{\"type\":\"service_account\",\"client_id\":\"cid\"}";
     try std.testing.expect((try parseAuthorizedUserAdc(allocator, adc_json)) == null);
+}
+
+test "parse service_account ADC credentials" {
+    const allocator = std.testing.allocator;
+    const adc_json =
+        \\{"type":"service_account","client_email":"svc@example.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n","token_uri":"https://oauth2.googleapis.com/token","project_id":"proj","quota_project_id":"quota"}
+    ;
+    var adc = (try parseServiceAccountAdc(allocator, adc_json)) orelse return error.TestExpectedEqual;
+    defer deinitAdcServiceAccount(allocator, &adc);
+    try std.testing.expectEqualStrings("svc@example.iam.gserviceaccount.com", adc.client_email);
+    try std.testing.expect(std.mem.startsWith(u8, adc.private_key, "-----BEGIN PRIVATE KEY-----"));
+    try std.testing.expectEqualStrings("https://oauth2.googleapis.com/token", adc.token_uri);
+    try std.testing.expect(adc.project_id != null);
+    try std.testing.expectEqualStrings("proj", adc.project_id.?);
+    try std.testing.expect(adc.quota_project_id != null);
+    try std.testing.expectEqualStrings("quota", adc.quota_project_id.?);
+}
+
+test "parse service_account ADC rejects non-service-account types" {
+    const allocator = std.testing.allocator;
+    const adc_json = "{\"type\":\"authorized_user\",\"client_email\":\"svc@example.com\"}";
+    try std.testing.expect((try parseServiceAccountAdc(allocator, adc_json)) == null);
 }
 
 test "containsCaseInsensitive matches mixed case substrings" {
