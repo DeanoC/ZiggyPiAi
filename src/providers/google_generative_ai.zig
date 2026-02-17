@@ -52,6 +52,13 @@ const GoogleCredentials = struct {
     project_id: ?[]const u8 = null,
 };
 
+const AdcAuthorizedUser = struct {
+    client_id: []const u8,
+    client_secret: []const u8,
+    refresh_token: []const u8,
+    quota_project_id: ?[]const u8 = null,
+};
+
 fn jsonObjectStringField(
     allocator: std.mem.Allocator,
     obj: std.json.ObjectMap,
@@ -139,6 +146,171 @@ fn resolveProjectId(allocator: std.mem.Allocator, creds: GoogleCredentials) !?[]
     return std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
         std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT_ID") catch
         std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null;
+}
+
+fn deinitAdcAuthorizedUser(allocator: std.mem.Allocator, adc: *AdcAuthorizedUser) void {
+    allocator.free(adc.client_id);
+    allocator.free(adc.client_secret);
+    allocator.free(adc.refresh_token);
+    if (adc.quota_project_id) |p| allocator.free(p);
+}
+
+fn isUnreservedUriByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    for (input) |c| {
+        if (isUnreservedUriByte(c)) {
+            try out.append(c);
+        } else {
+            const encoded = try std.fmt.allocPrint(allocator, "%{X:0>2}", .{c});
+            defer allocator.free(encoded);
+            for (encoded) |ec| try out.append(std.ascii.toUpper(ec));
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseAuthorizedUserAdc(allocator: std.mem.Allocator, contents: []const u8) !?AdcAuthorizedUser {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+
+    const type_v = obj.get("type") orelse return null;
+    if (type_v != .string or !std.mem.eql(u8, type_v.string, "authorized_user")) return null;
+
+    const client_id = (try jsonObjectStringField(allocator, obj, &.{"client_id"})) orelse return null;
+    errdefer allocator.free(client_id);
+    const client_secret = (try jsonObjectStringField(allocator, obj, &.{"client_secret"})) orelse return null;
+    errdefer allocator.free(client_secret);
+    const refresh_token = (try jsonObjectStringField(allocator, obj, &.{"refresh_token"})) orelse return null;
+    errdefer allocator.free(refresh_token);
+    const quota_project_id = try jsonObjectStringField(allocator, obj, &.{"quota_project_id"});
+
+    return .{
+        .client_id = client_id,
+        .client_secret = client_secret,
+        .refresh_token = refresh_token,
+        .quota_project_id = quota_project_id,
+    };
+}
+
+fn refreshVertexAdcToken(allocator: std.mem.Allocator, client: *std.http.Client, adc: AdcAuthorizedUser) !GoogleCredentials {
+    const encoded_client_id = try urlEncode(allocator, adc.client_id);
+    defer allocator.free(encoded_client_id);
+    const encoded_client_secret = try urlEncode(allocator, adc.client_secret);
+    defer allocator.free(encoded_client_secret);
+    const encoded_refresh_token = try urlEncode(allocator, adc.refresh_token);
+    defer allocator.free(encoded_refresh_token);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "client_id={s}&client_secret={s}&refresh_token={s}&grant_type=refresh_token",
+        .{ encoded_client_id, encoded_client_secret, encoded_refresh_token },
+    );
+    defer allocator.free(body);
+
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try appendHeader(&headers, "content-type", "application/x-www-form-urlencoded");
+
+    var req = try client.request(.POST, try std.Uri.parse("https://oauth2.googleapis.com/token"), .{ .extra_headers = headers.items });
+    defer req.deinit();
+    const body_mut = try allocator.dupe(u8, body);
+    defer allocator.free(body_mut);
+    try req.sendBodyComplete(body_mut);
+
+    var redirect_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return error.AdcTokenExchangeFailed;
+
+    var response_buf = std.array_list.Managed(u8).init(allocator);
+    defer response_buf.deinit();
+    var transfer_buffer: [8192]u8 = undefined;
+    const response_reader = response.reader(&transfer_buffer);
+    try readAllResponseBody(response_reader, &response_buf);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf.items, .{}) catch return error.AdcTokenExchangeFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AdcTokenExchangeFailed;
+    const token_v = parsed.value.object.get("access_token") orelse return error.AdcTokenExchangeFailed;
+    if (token_v != .string or token_v.string.len == 0) return error.AdcTokenExchangeFailed;
+
+    return .{
+        .token = try allocator.dupe(u8, token_v.string),
+        .project_id = if (adc.quota_project_id) |p| try allocator.dupe(u8, p) else null,
+    };
+}
+
+fn loadVertexMetadataServerToken(allocator: std.mem.Allocator, client: *std.http.Client) !?GoogleCredentials {
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try appendHeader(&headers, "metadata-flavor", "Google");
+
+    var req = client.request(
+        .GET,
+        std.Uri.parse("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token") catch return null,
+        .{ .extra_headers = headers.items },
+    ) catch return null;
+    defer req.deinit();
+    req.sendBodyComplete(&.{}) catch return null;
+
+    var redirect_buf: [4096]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch return null;
+    if (response.head.status != .ok) return null;
+
+    var response_buf = std.array_list.Managed(u8).init(allocator);
+    defer response_buf.deinit();
+    var transfer_buffer: [8192]u8 = undefined;
+    const response_reader = response.reader(&transfer_buffer);
+    readAllResponseBody(response_reader, &response_buf) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf.items, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const token_v = parsed.value.object.get("access_token") orelse return null;
+    if (token_v != .string or token_v.string.len == 0) return null;
+    return .{
+        .token = try allocator.dupe(u8, token_v.string),
+        .project_id = null,
+    };
+}
+
+fn resolveVertexAdcPath(allocator: std.mem.Allocator) !?[]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "GOOGLE_APPLICATION_CREDENTIALS")) |path| {
+        return path;
+    } else |_| {}
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home);
+    const out = try std.fmt.allocPrint(allocator, "{s}/.config/gcloud/application_default_credentials.json", .{home});
+    return out;
+}
+
+fn resolveVertexAdcCredentials(allocator: std.mem.Allocator, client: *std.http.Client) !?GoogleCredentials {
+    const adc_path = try resolveVertexAdcPath(allocator);
+    defer if (adc_path) |p| allocator.free(p);
+
+    if (adc_path) |path| {
+        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch null;
+        if (file) |f| {
+            defer f.close();
+            const contents = try f.readToEndAlloc(allocator, 1024 * 1024);
+            defer allocator.free(contents);
+            if (try parseAuthorizedUserAdc(allocator, contents)) |adc| {
+                defer {
+                    var a = adc;
+                    deinitAdcAuthorizedUser(allocator, &a);
+                }
+                return try refreshVertexAdcToken(allocator, client, adc);
+            }
+        }
+    }
+
+    return try loadVertexMetadataServerToken(allocator, client);
 }
 
 fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
@@ -311,11 +483,13 @@ pub fn streamGoogleGenerativeAI(
         try writeJson(body.writer(), request_id);
         try body.writer().writeByte('}');
     } else if (std.mem.eql(u8, model.api, "google-vertex")) {
-        if (isAuthenticatedPlaceholder(api_key)) {
-            try events.append(.{ .err = try allocator.dupe(u8, "GOOGLE_VERTEX_API_KEY or OAuth token is required for Vertex in ZiggyPiAi; ADC placeholder credentials are detected but not yet exchangeable here.") });
-            return;
-        }
-        var creds = try parseGoogleCredentials(allocator, api_key);
+        var creds = if (isAuthenticatedPlaceholder(api_key))
+            (try resolveVertexAdcCredentials(allocator, client) orelse {
+                try events.append(.{ .err = try allocator.dupe(u8, "GOOGLE_VERTEX_API_KEY/OAuth token missing and ADC token exchange failed. Ensure GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC authorized_user credentials are configured.") });
+                return;
+            })
+        else
+            try parseGoogleCredentials(allocator, api_key);
         defer deinitGoogleCredentials(allocator, &creds);
         const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
         defer allocator.free(auth);
@@ -572,6 +746,26 @@ test "parse google credentials supports nested oauth token payload" {
     try std.testing.expectEqualStrings("ya29.nested", creds.token);
     try std.testing.expect(creds.project_id != null);
     try std.testing.expectEqualStrings("nested-proj", creds.project_id.?);
+}
+
+test "parse authorized_user ADC credentials" {
+    const allocator = std.testing.allocator;
+    const adc_json =
+        \\{"type":"authorized_user","client_id":"cid","client_secret":"csecret","refresh_token":"rtok","quota_project_id":"qproj"}
+    ;
+    var adc = (try parseAuthorizedUserAdc(allocator, adc_json)) orelse return error.TestExpectedEqual;
+    defer deinitAdcAuthorizedUser(allocator, &adc);
+    try std.testing.expectEqualStrings("cid", adc.client_id);
+    try std.testing.expectEqualStrings("csecret", adc.client_secret);
+    try std.testing.expectEqualStrings("rtok", adc.refresh_token);
+    try std.testing.expect(adc.quota_project_id != null);
+    try std.testing.expectEqualStrings("qproj", adc.quota_project_id.?);
+}
+
+test "parse authorized_user ADC rejects non-authorized_user types" {
+    const allocator = std.testing.allocator;
+    const adc_json = "{\"type\":\"service_account\",\"client_id\":\"cid\"}";
+    try std.testing.expect((try parseAuthorizedUserAdc(allocator, adc_json)) == null);
 }
 
 test "containsCaseInsensitive matches mixed case substrings" {
