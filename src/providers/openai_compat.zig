@@ -58,7 +58,29 @@ fn appendList(dst: *std.array_list.Managed(u8), src: []const u8) !void {
     try dst.appendSlice(src);
 }
 
-fn normalizeToolCallId(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+fn normalizeMistralToolCallId(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer out.deinit();
+
+    for (id) |ch| {
+        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9')) {
+            try out.append(ch);
+        }
+    }
+    if (out.items.len > 9) {
+        out.items.len = 9;
+    } else if (out.items.len < 9) {
+        const padding = "ABCDEFGHI";
+        try out.appendSlice(padding[0 .. 9 - out.items.len]);
+    }
+    return out.toOwnedSlice();
+}
+
+fn normalizeToolCallId(allocator: std.mem.Allocator, id: []const u8, requires_mistral_ids: bool) ![]const u8 {
+    if (requires_mistral_ids) {
+        return normalizeMistralToolCallId(allocator, id);
+    }
+
     const sep = std.mem.indexOfScalar(u8, id, '|');
     const raw_id = if (sep) |idx| id[0..idx] else id;
     var normalized = std.array_list.Managed(u8).init(allocator);
@@ -83,12 +105,13 @@ fn cachedNormalizedToolCallId(
     allocator: std.mem.Allocator,
     raw_id: []const u8,
     tool_call_ids: *std.StringHashMap([]const u8),
+    requires_mistral_ids: bool,
 ) ![]const u8 {
     if (tool_call_ids.get(raw_id)) |cached| {
         return cached;
     }
 
-    const normalized = try normalizeToolCallId(allocator, raw_id);
+    const normalized = try normalizeToolCallId(allocator, raw_id, requires_mistral_ids);
     try tool_call_ids.put(raw_id, normalized);
     return normalized;
 }
@@ -123,8 +146,9 @@ fn appendToolCallInput(
     allocator: std.mem.Allocator,
     writer: anytype,
     tool_call: types.ToolCall,
+    requires_mistral_ids: bool,
 ) !void {
-    const normalized_id = try normalizeToolCallId(allocator, tool_call.id);
+    const normalized_id = try normalizeToolCallId(allocator, tool_call.id, requires_mistral_ids);
     defer allocator.free(normalized_id);
 
     try writer.writeAll("{\"id\":");
@@ -140,12 +164,13 @@ fn appendMessageTools(
     allocator: std.mem.Allocator,
     tool_calls: []const types.ToolCall,
     tool_call_ids: *std.StringHashMap([]const u8),
+    requires_mistral_ids: bool,
     writer: anytype,
 ) !void {
     try writer.writeAll(",\"tool_calls\":[");
     for (tool_calls, 0..) |tc, i| {
         if (i > 0) try writer.writeByte(',');
-        const normalized_id = try cachedNormalizedToolCallId(allocator, tc.id, tool_call_ids);
+        const normalized_id = try cachedNormalizedToolCallId(allocator, tc.id, tool_call_ids, requires_mistral_ids);
         try writer.writeAll("{\"id\":");
         try writeJson(writer, normalized_id);
         try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
@@ -161,11 +186,12 @@ fn appendToolResultText(
     allocator: std.mem.Allocator,
     msg: types.Message,
     tool_call_ids: *std.StringHashMap([]const u8),
+    requires_mistral_ids: bool,
     writer: anytype,
 ) !void {
     if (msg.tool_call_id) |tool_call_id| {
         try writer.writeAll(",\"tool_call_id\":");
-        const normalized_tool_call_id = try cachedNormalizedToolCallId(allocator, tool_call_id, tool_call_ids);
+        const normalized_tool_call_id = try cachedNormalizedToolCallId(allocator, tool_call_id, tool_call_ids, requires_mistral_ids);
         try writeJson(writer, normalized_tool_call_id);
     } else {
         return;
@@ -489,6 +515,7 @@ pub fn streamOpenAICompat(
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     const api_key = options.api_key orelse return error.MissingApiKey;
+    const requires_mistral_ids = std.mem.eql(u8, model.provider, "mistral");
 
     var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
@@ -513,7 +540,7 @@ pub fn streamOpenAICompat(
         if (msg.role == .assistant) {
             if (msg.tool_calls) |tool_calls| {
                 for (tool_calls) |tc| {
-                    _ = try cachedNormalizedToolCallId(allocator, tc.id, &tool_call_ids);
+                    _ = try cachedNormalizedToolCallId(allocator, tc.id, &tool_call_ids, requires_mistral_ids);
                 }
             }
         }
@@ -534,10 +561,10 @@ pub fn streamOpenAICompat(
         try body.writer().writeAll(",\"content\":");
         try appendMessageContentText(allocator, msg, body.writer());
         if (msg.tool_calls) |tool_calls| {
-            try appendMessageTools(allocator, tool_calls, &tool_call_ids, body.writer());
+            try appendMessageTools(allocator, tool_calls, &tool_call_ids, requires_mistral_ids, body.writer());
         }
         if (msg.role == .tool or msg.role == .tool_result) {
-            try appendToolResultText(allocator, msg, &tool_call_ids, body.writer());
+            try appendToolResultText(allocator, msg, &tool_call_ids, requires_mistral_ids, body.writer());
         }
         try body.writer().writeAll("}");
     }
@@ -677,9 +704,27 @@ test "cached tool-call ID normalization memoizes" {
         map.deinit();
     }
 
-    const first = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
-    const second = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
+    const first = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map, false);
+    const second = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map, false);
     try std.testing.expect(std.mem.eql(u8, first, second));
+}
+
+test "mistral tool-call ID normalization matches length constraints" {
+    const allocator = std.testing.allocator;
+    const short = try normalizeToolCallId(allocator, "id!", true);
+    defer allocator.free(short);
+    const long = try normalizeToolCallId(allocator, "very-long/tool-id-with-symbols", true);
+    defer allocator.free(long);
+    const response_style = try normalizeToolCallId(allocator, "call_abc|extremely/long+opaque=id", true);
+    defer allocator.free(response_style);
+
+    try std.testing.expectEqual(@as(usize, 9), short.len);
+    try std.testing.expectEqual(@as(usize, 9), long.len);
+    try std.testing.expectEqual(@as(usize, 9), response_style.len);
+    for (response_style) |ch| {
+        const is_alnum = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9');
+        try std.testing.expect(is_alnum);
+    }
 }
 
 test "derive github copilot base url from proxy token" {

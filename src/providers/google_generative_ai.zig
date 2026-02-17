@@ -23,8 +23,22 @@ fn mapGoogleStopReason(reason: []const u8) types.StopReason {
     if (std.mem.eql(u8, reason, "STOP")) return .stop;
     if (std.mem.eql(u8, reason, "MAX_TOKENS")) return .length;
     if (std.mem.eql(u8, reason, "TOOL_CALL")) return .tool_use;
+    if (std.mem.eql(u8, reason, "BLOCKLIST")) return .err;
+    if (std.mem.eql(u8, reason, "PROHIBITED_CONTENT")) return .err;
+    if (std.mem.eql(u8, reason, "SPII")) return .err;
+    if (std.mem.eql(u8, reason, "SAFETY")) return .err;
+    if (std.mem.eql(u8, reason, "IMAGE_SAFETY")) return .err;
+    if (std.mem.eql(u8, reason, "IMAGE_PROHIBITED_CONTENT")) return .err;
+    if (std.mem.eql(u8, reason, "IMAGE_RECITATION")) return .err;
+    if (std.mem.eql(u8, reason, "IMAGE_OTHER")) return .err;
+    if (std.mem.eql(u8, reason, "RECITATION")) return .err;
+    if (std.mem.eql(u8, reason, "FINISH_REASON_UNSPECIFIED")) return .err;
+    if (std.mem.eql(u8, reason, "OTHER")) return .err;
+    if (std.mem.eql(u8, reason, "LANGUAGE")) return .err;
     if (std.mem.eql(u8, reason, "MALFORMED_FUNCTION_CALL")) return .err;
-    return .stop;
+    if (std.mem.eql(u8, reason, "UNEXPECTED_TOOL_CALL")) return .err;
+    if (std.mem.eql(u8, reason, "NO_IMAGE")) return .err;
+    return .err;
 }
 
 fn isAuthenticatedPlaceholder(value: []const u8) bool {
@@ -881,6 +895,8 @@ test "google stop reason mapping" {
     try std.testing.expect(mapGoogleStopReason("STOP") == .stop);
     try std.testing.expect(mapGoogleStopReason("MAX_TOKENS") == .length);
     try std.testing.expect(mapGoogleStopReason("TOOL_CALL") == .tool_use);
+    try std.testing.expect(mapGoogleStopReason("SAFETY") == .err);
+    try std.testing.expect(mapGoogleStopReason("FINISH_REASON_UNSPECIFIED") == .err);
 }
 
 test "parse google credentials supports raw token" {
