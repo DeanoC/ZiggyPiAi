@@ -1,5 +1,6 @@
 const std = @import("std");
 const codex_oauth = @import("oauth/openai_codex_oauth.zig");
+const provider_oauth = @import("oauth/provider_oauth.zig");
 
 fn fileExistsAbsolute(path: []const u8) bool {
     std.fs.accessAbsolute(path, .{}) catch return false;
@@ -27,6 +28,7 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
         return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
     if (std.mem.eql(u8, provider, "openai-codex")) {
         return std.process.getEnvVarOwned(allocator, "OPENAI_CODEX_API_KEY") catch
+            provider_oauth.getPiOAuthApiKey(allocator, "openai-codex") orelse
             codex_oauth.getCodexOauthApiKey(allocator) orelse
             std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
     }
@@ -38,6 +40,7 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
     }
     if (std.mem.eql(u8, provider, "anthropic"))
         return std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN") catch
+            provider_oauth.getPiOAuthApiKey(allocator, "anthropic") orelse
             std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
     if (std.mem.eql(u8, provider, "kimi-coding") or std.mem.eql(u8, provider, "kimi-code")) {
         return std.process.getEnvVarOwned(allocator, "KIMICODE_API_KEY") catch
@@ -50,7 +53,8 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
     if (std.mem.eql(u8, provider, "github-copilot")) {
         return std.process.getEnvVarOwned(allocator, "COPILOT_GITHUB_TOKEN") catch
             std.process.getEnvVarOwned(allocator, "GH_TOKEN") catch
-            std.process.getEnvVarOwned(allocator, "GITHUB_TOKEN") catch null;
+            std.process.getEnvVarOwned(allocator, "GITHUB_TOKEN") catch
+            provider_oauth.getPiOAuthApiKey(allocator, "github-copilot") orelse null;
     }
     if (std.mem.eql(u8, provider, "openrouter")) {
         return std.process.getEnvVarOwned(allocator, "OPENROUTER_API_KEY") catch null;
@@ -90,8 +94,8 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "google-gemini-cli") or std.mem.eql(u8, provider, "google-antigravity")) {
-        // Cloud Code Assist providers use OAuth bearer credentials, not static API keys.
-        return null;
+        // Cloud Code Assist providers use OAuth bearer credentials from ~/.pi/agent/auth.json.
+        return provider_oauth.getPiOAuthApiKey(allocator, provider);
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
         const project = std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch

@@ -13,6 +13,8 @@ Initial Zig port of `pi-mono/packages/ai`.
 ## OAuth & API key handling
 
 - `env_api_keys.zig` resolves provider credentials from environment variables whenever possible.
+- OAuth-backed providers also read `~/.pi/agent/auth.json` entries (`type: "oauth"`) with refresh-on-expiry parity for `openai-codex`, `anthropic`, `github-copilot`, `google-gemini-cli`, and `google-antigravity`.
+- Google OAuth refresh from `~/.pi/agent/auth.json` uses env-provided OAuth client credentials when needed: `GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID` + `GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET` (and Antigravity equivalents).
 - The `openai` and `openai-responses` providers require `OPENAI_API_KEY` (or the equivalent entry in a `.env`) so the mock server can validate requests during integration tests.
 - The `openai-codex` provider prefers `OPENAI_CODEX_API_KEY` and otherwise falls back to the OAuth tokens stored in `~/.codex/auth.json` (the same file the Codex browser flow populates). It also accepts `OPENAI_API_KEY` as a final fallback.
 - `kimi-code` and `kimi-coding` use `KIMICODE_API_KEY`, with `KIMI_API_KEY` and `ANTHROPIC_API_KEY` as secondary fallbacks, so you can reuse an Anthropic key if needed.
@@ -52,12 +54,14 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Model registration parity generated from `pi-mono/packages/ai/src/models.generated.ts` for currently supported providers
 - Additional provider families from generated models now included when they map to implemented adapters (for example `openrouter`, `groq`, `cerebras`, `mistral`, `xai`, `zai`, `huggingface`, `minimax`, `minimax-cn`, `opencode`, `vercel-ai-gateway`, `github-copilot`)
 - Centralized OpenAI Codex OAuth flow (`src/oauth/openai_codex_oauth.zig`) used by env key resolution
+- Shared OAuth credential resolver (`src/oauth/provider_oauth.zig`) for `~/.pi/agent/auth.json` parity, including provider-specific token refresh and Google `{token, projectId}` API-key payload shaping
 
 ### Not Yet Supported
 
 - Full Bedrock streaming event protocol parity (`converse-stream` chunk-by-chunk semantics) beyond current unified response mapping
 - Full provider parity for all pi-mono providers (only the providers listed in Supported are wired in Zig)
 - Complete schema-validation/util parity from TS utility modules
+- Interactive OAuth login parity for non-Codex providers (token refresh and persisted credential resolution are implemented)
 
 ## Implemented in this milestone
 

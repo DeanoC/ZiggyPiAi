@@ -6,6 +6,7 @@ pub const stream = @import("stream.zig");
 pub const transform_messages = @import("transform_messages.zig");
 pub const oauth = struct {
     pub const openai_codex = @import("oauth/openai_codex_oauth.zig");
+    pub const provider_oauth = @import("oauth/provider_oauth.zig");
 };
 pub const providers = struct {
     pub const anthropic_messages = @import("providers/anthropic_messages.zig");
@@ -26,6 +27,7 @@ test {
     _ = transform_messages;
     _ = oauth;
     _ = oauth.openai_codex;
+    _ = oauth.provider_oauth;
     _ = providers;
     _ = providers.anthropic_messages;
     _ = providers.bedrock_converse_stream;
