@@ -511,6 +511,8 @@ pub fn streamBedrockConverseStream(
     const aws_region = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch
         std.process.getEnvVarOwned(allocator, "AWS_DEFAULT_REGION") catch null;
     defer if (aws_region) |v| allocator.free(v);
+    const aws_skip_auth = std.process.getEnvVarOwned(allocator, "AWS_BEDROCK_SKIP_AUTH") catch null;
+    defer if (aws_skip_auth) |v| allocator.free(v);
 
     var sigv4_auth_buf: [1024]u8 = undefined;
     var sigv4_amz_date_buf: [16]u8 = undefined;
@@ -520,6 +522,8 @@ pub fn streamBedrockConverseStream(
         const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
         defer allocator.free(auth);
         try appendHeader(&headers, "Authorization", auth);
+    } else if (aws_skip_auth != null and std.mem.eql(u8, aws_skip_auth.?, "1")) {
+        // For proxy/gateway scenarios that do their own auth upstream.
     } else if (aws_access_key_id != null and aws_secret_access_key != null) {
         const region_owned = if (aws_region) |region|
             try allocator.dupe(u8, region)

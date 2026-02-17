@@ -35,16 +35,20 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Anthropic Messages (`anthropic-messages`) via `src/providers/anthropic_messages.zig`
 - Kimi routing through Anthropic-compatible provider aliases (`kimi-code`, `kimi-coding`)
 - Google Generative AI (`google-generative-ai`) via `src/providers/google_generative_ai.zig`
+- Google provider aliases `google-gemini-cli` and `google-vertex` (wired to the same adapter path)
+- Amazon Bedrock Converse (`bedrock-converse-stream`) via `src/providers/bedrock_converse_stream.zig`
+  - Supports `AWS_BEARER_TOKEN_BEDROCK` bearer auth
+  - Supports AWS IAM SigV4 signing via `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)
+  - Supports `AWS_BEDROCK_SKIP_AUTH=1` for proxy/gateway scenarios
 - Simple + full stream provider registration paths (`stream` and `stream_simple`)
 - Spark model coverage including `gpt-5.3-codex-spark` and `chatgpt5.3-spark` aliases in `src/models.zig`
+- Model registration parity generated from `pi-mono/packages/ai/src/models.generated.ts` for currently supported providers
+- Centralized OpenAI Codex OAuth flow (`src/oauth/openai_codex_oauth.zig`) used by env key resolution
 
 ### Not Yet Supported
 
-- Full Bedrock runtime/signing + event mapping parity (provider is registered but intentionally returns a not-implemented error in `src/providers/bedrock_converse_stream.zig`)
-- Google Gemini CLI provider (`google-gemini-cli`)
-- Google Vertex provider (`google-vertex`)
-- Full TS parity for all providers/models generated in `pi-mono/packages/ai/src/models.generated.ts`
-- Full OAuth flow parity beyond current OpenAI Codex token handling in `src/env_api_keys.zig`
+- Full Bedrock streaming event protocol parity (`converse-stream` chunk-by-chunk semantics) beyond current unified response mapping
+- Full provider parity for all pi-mono providers (only the providers listed in Supported are wired in Zig)
 - Complete schema-validation/util parity from TS utility modules
 
 ## Implemented in this milestone
@@ -62,12 +66,12 @@ Initial Zig port of `pi-mono/packages/ai`.
 - OpenAI Responses provider (`src/providers/openai_responses.zig`)
 - Google Generative AI provider (`src/providers/google_generative_ai.zig`)
 - Anthropic Messages provider (`src/providers/anthropic_messages.zig`) used by Anthropic and Kimi (`kimi-coding`/`kimi-code`) model entries
-- Bedrock Converse Stream placeholder provider (`src/providers/bedrock_converse_stream.zig`) currently returns a clear not-implemented error
+- Bedrock Converse provider (`src/providers/bedrock_converse_stream.zig`) with auth/signing and event mapping
 - Expanded default model coverage includes `openai-codex` variants (`gpt-5.1`, `gpt-5.1-codex-mini`, etc.) and Kimi aliases (`kimi-code`)
 
 ## Notes
 
 - This is a first functional port focused on architecture parity.
-- Multi-provider support (Bedrock, Google, OAuth flows, and schema validation) has not been fully ported yet.
-- Google Generative AI is now available via direct REST streaming (`google-generative-ai`); Bedrock is registered and emits explicit "not implemented yet" provider errors while the full AWS runtime/signing port is pending.
+- Multi-provider support has progressed substantially, but full TS utility/schema parity is still pending.
+- Google Generative AI is available via direct REST streaming, including provider aliases used by model generation.
 - CI runs `zig build test`, targeted integration tests, and model sync checks via `.github/workflows/ci.yml`.
