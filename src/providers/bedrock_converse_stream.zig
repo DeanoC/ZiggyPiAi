@@ -667,6 +667,399 @@ fn appendThinkingEvent(
     try events.append(.{ .thinking_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, text) } });
 }
 
+const EventBlockKind = enum { text, thinking, tool };
+
+const EventBlockState = struct {
+    kind: EventBlockKind,
+    content_index: usize,
+    text: std.array_list.Managed(u8),
+    tool_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+
+    fn init(allocator: std.mem.Allocator, kind: EventBlockKind, content_index: usize) EventBlockState {
+        return .{
+            .kind = kind,
+            .content_index = content_index,
+            .text = std.array_list.Managed(u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *EventBlockState, allocator: std.mem.Allocator) void {
+        self.text.deinit();
+        if (self.tool_id) |v| allocator.free(v);
+        if (self.tool_name) |v| allocator.free(v);
+    }
+};
+
+fn readU16be(bytes: []const u8) u16 {
+    return (@as(u16, bytes[0]) << 8) | @as(u16, bytes[1]);
+}
+
+fn readU32be(bytes: []const u8) u32 {
+    return (@as(u32, bytes[0]) << 24) | (@as(u32, bytes[1]) << 16) | (@as(u32, bytes[2]) << 8) | @as(u32, bytes[3]);
+}
+
+fn parseHeaderValueEnd(bytes: []const u8, value_type: u8, cursor: usize) ?usize {
+    return switch (value_type) {
+        0, 1 => cursor,
+        2 => cursor + 1,
+        3 => cursor + 2,
+        4 => cursor + 4,
+        5 => cursor + 8,
+        6, 7 => blk: {
+            if (cursor + 2 > bytes.len) break :blk null;
+            const len = readU16be(bytes[cursor .. cursor + 2]);
+            break :blk cursor + 2 + len;
+        },
+        8 => cursor + 8,
+        9 => cursor + 16,
+        else => null,
+    };
+}
+
+fn usageInt(v: std.json.Value) ?u32 {
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        else => null,
+    };
+}
+
+fn parseEventPayload(allocator: std.mem.Allocator, payload: []const u8) !?std.json.Parsed(std.json.Value) {
+    if (payload.len == 0) return null;
+    return std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch null;
+}
+
+fn parseConverseEventStreamResponse(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    model: types.Model,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    var usage: types.Usage = .{};
+    var stop_reason: types.StopReason = .stop;
+    var out = types.AssistantMessage{
+        .text = "",
+        .thinking = "",
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = usage,
+    };
+
+    var emitted_start = false;
+    var next_content_index: usize = 0;
+
+    var full_text = std.array_list.Managed(u8).init(allocator);
+    defer full_text.deinit();
+    var full_thinking = std.array_list.Managed(u8).init(allocator);
+    defer full_thinking.deinit();
+    var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
+    defer tool_calls.deinit();
+
+    var blocks = std.AutoHashMap(usize, *EventBlockState).init(allocator);
+    defer {
+        var it = blocks.iterator();
+        while (it.next()) |entry| {
+            var state = entry.value_ptr.*; // pointer
+            state.deinit(allocator);
+            allocator.destroy(state);
+        }
+        blocks.deinit();
+    }
+
+    var cursor: usize = 0;
+    while (cursor < payload.len) {
+        if (cursor + 12 > payload.len) return error.InvalidBedrockEventStream;
+        const total_len = readU32be(payload[cursor .. cursor + 4]);
+        const headers_len = readU32be(payload[cursor + 4 .. cursor + 8]);
+        if (total_len < 16) return error.InvalidBedrockEventStream;
+        if (cursor + total_len > payload.len) return error.InvalidBedrockEventStream;
+
+        const headers_start = cursor + 12;
+        const headers_end = headers_start + headers_len;
+        if (headers_end > cursor + total_len - 4) return error.InvalidBedrockEventStream;
+        const payload_start = headers_end;
+        const payload_end = cursor + total_len - 4;
+
+        var event_type: ?[]const u8 = null;
+        var hcursor = headers_start;
+        while (hcursor < headers_end) {
+            if (hcursor + 2 > headers_end) return error.InvalidBedrockEventStream;
+            const name_len = payload[hcursor];
+            hcursor += 1;
+            if (hcursor + name_len + 1 > headers_end) return error.InvalidBedrockEventStream;
+            const name = payload[hcursor .. hcursor + name_len];
+            hcursor += name_len;
+            const value_type = payload[hcursor];
+            hcursor += 1;
+            const value_start = hcursor;
+            const value_end = parseHeaderValueEnd(payload, value_type, value_start) orelse return error.InvalidBedrockEventStream;
+            if (value_end > headers_end) return error.InvalidBedrockEventStream;
+
+            if ((std.mem.eql(u8, name, ":event-type") or std.mem.eql(u8, name, "event-type")) and value_type == 7) {
+                if (value_start + 2 > headers_end) return error.InvalidBedrockEventStream;
+                const len = readU16be(payload[value_start .. value_start + 2]);
+                const str_start = value_start + 2;
+                const str_end = str_start + len;
+                if (str_end > headers_end) return error.InvalidBedrockEventStream;
+                event_type = payload[str_start..str_end];
+            }
+            hcursor = value_end;
+        }
+
+        if (event_type) |kind| {
+            const event_payload = payload[payload_start..payload_end];
+            var parsed_opt = try parseEventPayload(allocator, event_payload);
+            defer if (parsed_opt) |*p| p.deinit();
+            const root = if (parsed_opt) |p| p.value else std.json.Value{ .null = {} };
+
+            if (std.mem.eql(u8, kind, "messageStart")) {
+                if (!emitted_start) {
+                    try events.append(.{ .start = out });
+                    emitted_start = true;
+                }
+            } else if (std.mem.eql(u8, kind, "contentBlockStart")) {
+                if (root != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+                const index_v = root.object.get("contentBlockIndex") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (index_v != .integer or index_v.integer < 0) {
+                    cursor += total_len;
+                    continue;
+                }
+                const block_index: usize = @intCast(index_v.integer);
+                const start_v = root.object.get("start") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (start_v != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+                const tool_v = start_v.object.get("toolUse") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (tool_v != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+                const id_v = tool_v.object.get("toolUseId") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                const name_v = tool_v.object.get("name") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (id_v != .string or name_v != .string) {
+                    cursor += total_len;
+                    continue;
+                }
+
+                var state = try allocator.create(EventBlockState);
+                state.* = EventBlockState.init(allocator, .tool, next_content_index);
+                state.tool_id = try allocator.dupe(u8, id_v.string);
+                state.tool_name = try allocator.dupe(u8, name_v.string);
+                try blocks.put(block_index, state);
+                try events.append(.{ .toolcall_start = next_content_index });
+                next_content_index += 1;
+            } else if (std.mem.eql(u8, kind, "contentBlockDelta")) {
+                if (root != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+                const index_v = root.object.get("contentBlockIndex") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (index_v != .integer or index_v.integer < 0) {
+                    cursor += total_len;
+                    continue;
+                }
+                const block_index: usize = @intCast(index_v.integer);
+                const delta_v = root.object.get("delta") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (delta_v != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+
+                if (delta_v.object.get("text")) |text_v| {
+                    if (text_v == .string and text_v.string.len > 0) {
+                        var state = blocks.get(block_index);
+                        if (state == null) {
+                            const created = try allocator.create(EventBlockState);
+                            created.* = EventBlockState.init(allocator, .text, next_content_index);
+                            try blocks.put(block_index, created);
+                            try events.append(.{ .text_start = next_content_index });
+                            state = created;
+                            next_content_index += 1;
+                        }
+                        if (state.?.kind == .text) {
+                            try state.?.text.appendSlice(text_v.string);
+                            try full_text.appendSlice(text_v.string);
+                            try events.append(.{ .text_delta = .{
+                                .content_index = state.?.content_index,
+                                .delta = try allocator.dupe(u8, text_v.string),
+                            } });
+                        }
+                    }
+                } else if (delta_v.object.get("reasoningContent")) |reasoning_v| {
+                    if (reasoning_v == .object) {
+                        if (reasoning_v.object.get("text")) |text_v| {
+                            if (text_v == .string and text_v.string.len > 0) {
+                                var state = blocks.get(block_index);
+                                if (state == null) {
+                                    const created = try allocator.create(EventBlockState);
+                                    created.* = EventBlockState.init(allocator, .thinking, next_content_index);
+                                    try blocks.put(block_index, created);
+                                    try events.append(.{ .thinking_start = next_content_index });
+                                    state = created;
+                                    next_content_index += 1;
+                                }
+                                if (state.?.kind == .thinking) {
+                                    try state.?.text.appendSlice(text_v.string);
+                                    try full_thinking.appendSlice(text_v.string);
+                                    try events.append(.{ .thinking_delta = .{
+                                        .content_index = state.?.content_index,
+                                        .delta = try allocator.dupe(u8, text_v.string),
+                                    } });
+                                }
+                            }
+                        }
+                    }
+                } else if (delta_v.object.get("toolUse")) |tool_v| {
+                    if (tool_v == .object) {
+                        if (tool_v.object.get("input")) |input_v| {
+                            if (input_v == .string and input_v.string.len > 0) {
+                                const state = blocks.get(block_index) orelse {
+                                    cursor += total_len;
+                                    continue;
+                                };
+                                if (state.kind == .tool) {
+                                    try state.text.appendSlice(input_v.string);
+                                    try events.append(.{ .toolcall_delta = .{
+                                        .content_index = state.content_index,
+                                        .delta = try allocator.dupe(u8, input_v.string),
+                                    } });
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (std.mem.eql(u8, kind, "contentBlockStop")) {
+                if (root != .object) {
+                    cursor += total_len;
+                    continue;
+                }
+                const index_v = root.object.get("contentBlockIndex") orelse {
+                    cursor += total_len;
+                    continue;
+                };
+                if (index_v != .integer or index_v.integer < 0) {
+                    cursor += total_len;
+                    continue;
+                }
+                const block_index: usize = @intCast(index_v.integer);
+                if (blocks.fetchRemove(block_index)) |removed| {
+                    var state = removed.value;
+                    defer {
+                        state.deinit(allocator);
+                        allocator.destroy(state);
+                    }
+                    switch (state.kind) {
+                        .text => try events.append(.{ .text_end = .{
+                            .content_index = state.content_index,
+                            .content = try allocator.dupe(u8, state.text.items),
+                        } }),
+                        .thinking => try events.append(.{ .thinking_end = .{
+                            .content_index = state.content_index,
+                            .content = try allocator.dupe(u8, state.text.items),
+                        } }),
+                        .tool => {
+                            const args_json = if (state.text.items.len == 0)
+                                try allocator.dupe(u8, "{}")
+                            else
+                                try allocator.dupe(u8, state.text.items);
+                            defer allocator.free(args_json);
+                            const id = state.tool_id orelse "";
+                            const name = state.tool_name orelse "";
+                            try tool_calls.append(.{
+                                .id = try allocator.dupe(u8, id),
+                                .name = try allocator.dupe(u8, name),
+                                .arguments_json = try allocator.dupe(u8, args_json),
+                            });
+                            try events.append(.{ .toolcall_end = .{
+                                .content_index = state.content_index,
+                                .tool_call = .{
+                                    .id = try allocator.dupe(u8, id),
+                                    .name = try allocator.dupe(u8, name),
+                                    .arguments_json = try allocator.dupe(u8, args_json),
+                                },
+                            } });
+                        },
+                    }
+                }
+            } else if (std.mem.eql(u8, kind, "messageStop")) {
+                if (root == .object) {
+                    if (root.object.get("stopReason")) |reason_v| {
+                        if (reason_v == .string) stop_reason = mapStopReason(reason_v.string);
+                    }
+                }
+            } else if (std.mem.eql(u8, kind, "metadata")) {
+                if (root == .object) {
+                    if (root.object.get("usage")) |usage_v| {
+                        if (usage_v == .object) {
+                            if (usage_v.object.get("inputTokens")) |v| {
+                                if (usageInt(v)) |n| usage.input = n;
+                            }
+                            if (usage_v.object.get("outputTokens")) |v| {
+                                if (usageInt(v)) |n| usage.output = n;
+                            }
+                            if (usage_v.object.get("totalTokens")) |v| {
+                                if (usageInt(v)) |n| usage.total_tokens = n;
+                            }
+                            if (usage_v.object.get("cacheReadInputTokens")) |v| {
+                                if (usageInt(v)) |n| usage.cache_read = n;
+                            }
+                            if (usage_v.object.get("cacheWriteInputTokens")) |v| {
+                                if (usageInt(v)) |n| usage.cache_write = n;
+                            }
+                            types.calculateCost(model, &usage);
+                        }
+                    }
+                }
+            } else if (std.mem.endsWith(u8, kind, "Exception")) {
+                if (root == .object and root.object.get("message") != null and root.object.get("message").? == .string) {
+                    try events.append(.{ .err = try allocator.dupe(u8, root.object.get("message").?.string) });
+                } else {
+                    try events.append(.{ .err = try allocator.dupe(u8, "Bedrock stream exception") });
+                }
+                return;
+            }
+        }
+        cursor += total_len;
+    }
+
+    if (!emitted_start) {
+        try events.append(.{ .start = out });
+    }
+    out.text = try allocator.dupe(u8, full_text.items);
+    out.thinking = try allocator.dupe(u8, full_thinking.items);
+    out.tool_calls = try tool_calls.toOwnedSlice();
+    out.usage = usage;
+    out.stop_reason = stop_reason;
+    try events.append(.{ .done = out });
+}
+
 fn parseConverseResponse(
     allocator: std.mem.Allocator,
     payload: []const u8,
@@ -819,7 +1212,7 @@ pub fn streamBedrockConverseStream(
 ) !void {
     const endpoint = try std.fmt.allocPrint(
         allocator,
-        "{s}/model/{s}/converse",
+        "{s}/model/{s}/converse-stream",
         .{ std.mem.trimRight(u8, model.base_url, "/"), model.id },
     );
     defer allocator.free(endpoint);
@@ -919,7 +1312,7 @@ pub fn streamBedrockConverseStream(
     }
 
     try appendHeader(&headers, "content-type", "application/json");
-    try appendHeader(&headers, "accept", "application/json");
+    try appendHeader(&headers, "accept", "application/vnd.amazon.eventstream");
 
     if (options.headers) |custom_headers| {
         for (custom_headers) |header| try appendHeader(&headers, header.name, header.value);
@@ -947,7 +1340,10 @@ pub fn streamBedrockConverseStream(
         return;
     }
 
-    try parseConverseResponse(allocator, response_buf.items, model, events);
+    parseConverseEventStreamResponse(allocator, response_buf.items, model, events) catch {
+        // Fallback for proxies that transform converse-stream responses into regular JSON.
+        try parseConverseResponse(allocator, response_buf.items, model, events);
+    };
 }
 
 test "bedrock stop reason mapping" {
@@ -1078,4 +1474,124 @@ test "bedrock sigv4 authorization shape" {
     try std.testing.expect(std.mem.startsWith(u8, sig.amz_date, "20240215T"));
     try std.testing.expect(sig.amz_date[15] == 'Z');
     try std.testing.expect(sig.payload_sha256.len == 64);
+}
+
+fn appendU32be(out: *std.array_list.Managed(u8), value: u32) !void {
+    try out.append(@intCast((value >> 24) & 0xff));
+    try out.append(@intCast((value >> 16) & 0xff));
+    try out.append(@intCast((value >> 8) & 0xff));
+    try out.append(@intCast(value & 0xff));
+}
+
+fn buildEventStreamFrame(allocator: std.mem.Allocator, event_type: []const u8, json_payload: []const u8) ![]u8 {
+    var headers = std.array_list.Managed(u8).init(allocator);
+    defer headers.deinit();
+
+    const header_name = ":event-type";
+    try headers.append(@intCast(header_name.len));
+    try headers.appendSlice(header_name);
+    try headers.append(7); // string header value
+    try headers.append(@intCast((event_type.len >> 8) & 0xff));
+    try headers.append(@intCast(event_type.len & 0xff));
+    try headers.appendSlice(event_type);
+
+    const headers_len: u32 = @intCast(headers.items.len);
+    const payload_len: u32 = @intCast(json_payload.len);
+    const total_len: u32 = 16 + headers_len + payload_len;
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try appendU32be(&out, total_len);
+    try appendU32be(&out, headers_len);
+    try appendU32be(&out, 0); // prelude crc (ignored in parser)
+    try out.appendSlice(headers.items);
+    try out.appendSlice(json_payload);
+    try appendU32be(&out, 0); // message crc (ignored in parser)
+    return out.toOwnedSlice();
+}
+
+test "bedrock eventstream parser emits streaming events" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const f1 = try buildEventStreamFrame(allocator, "messageStart", "{\"role\":\"assistant\"}");
+    defer allocator.free(f1);
+    const f2 = try buildEventStreamFrame(
+        allocator,
+        "contentBlockDelta",
+        "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"hello\"}}",
+    );
+    defer allocator.free(f2);
+    const f3 = try buildEventStreamFrame(allocator, "contentBlockStop", "{\"contentBlockIndex\":0}");
+    defer allocator.free(f3);
+    const f4 = try buildEventStreamFrame(allocator, "messageStop", "{\"stopReason\":\"end_turn\"}");
+    defer allocator.free(f4);
+    const f5 = try buildEventStreamFrame(
+        allocator,
+        "metadata",
+        "{\"usage\":{\"inputTokens\":1,\"outputTokens\":2,\"totalTokens\":3}}",
+    );
+    defer allocator.free(f5);
+
+    var payload = std.array_list.Managed(u8).init(allocator);
+    defer payload.deinit();
+    try payload.appendSlice(f1);
+    try payload.appendSlice(f2);
+    try payload.appendSlice(f3);
+    try payload.appendSlice(f4);
+    try payload.appendSlice(f5);
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |v| allocator.free(v.delta),
+                .text_end => |v| allocator.free(v.content),
+                .thinking_delta => |v| allocator.free(v.delta),
+                .thinking_end => |v| allocator.free(v.content),
+                .toolcall_delta => |v| allocator.free(v.delta),
+                .toolcall_end => |v| {
+                    allocator.free(v.tool_call.id);
+                    allocator.free(v.tool_call.name);
+                    allocator.free(v.tool_call.arguments_json);
+                },
+                .done => |v| {
+                    allocator.free(v.text);
+                    allocator.free(v.thinking);
+                    for (v.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    allocator.free(v.tool_calls);
+                },
+                .err => |v| allocator.free(v),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseConverseEventStreamResponse(allocator, payload.items, model, &events);
+    try std.testing.expect(events.items.len >= 4);
+    const last = events.items[events.items.len - 1];
+    switch (last) {
+        .done => |msg| {
+            try std.testing.expectEqualStrings("hello", msg.text);
+            try std.testing.expectEqual(@as(u32, 1), msg.usage.input);
+            try std.testing.expectEqual(@as(u32, 2), msg.usage.output);
+            try std.testing.expectEqual(@as(u32, 3), msg.usage.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
