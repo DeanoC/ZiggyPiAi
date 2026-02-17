@@ -56,13 +56,14 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Additional provider families from generated models now included when they map to implemented adapters (for example `openrouter`, `groq`, `cerebras`, `mistral`, `xai`, `zai`, `huggingface`, `minimax`, `minimax-cn`, `opencode`, `vercel-ai-gateway`, `github-copilot`)
 - Centralized OpenAI Codex OAuth flow (`src/oauth/openai_codex_oauth.zig`) used by env key resolution
 - Shared OAuth credential resolver (`src/oauth/provider_oauth.zig`) for `~/.pi/agent/auth.json` parity, including provider-specific token refresh and Google `{token, projectId}` API-key payload shaping
+- Interactive OAuth flow primitives for non-Codex providers (`src/oauth/provider_login_oauth.zig`): Anthropic auth-code flow, GitHub Copilot device flow, Google Gemini CLI/Antigravity auth-code flows, callback capture, and refresh helpers
 
 ### Not Yet Supported
 
 - Full Bedrock streaming event protocol parity (`converse-stream` chunk-by-chunk semantics) beyond current unified response mapping
 - Full provider parity for all pi-mono providers (only the providers listed in Supported are wired in Zig)
 - Complete schema-validation/util parity from TS utility modules
-- Interactive OAuth login parity for non-Codex providers (token refresh and persisted credential resolution are implemented)
+- Full automatic project discovery/provisioning parity for Google OAuth login flows (helpers are present; callers still own project selection/persistence orchestration)
 
 ## Implemented in this milestone
 
