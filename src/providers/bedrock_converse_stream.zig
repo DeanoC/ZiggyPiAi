@@ -479,13 +479,31 @@ fn appendMessageText(allocator: std.mem.Allocator, msg: types.Message, writer: a
     return true;
 }
 
-fn appendAssistantToolCalls(writer: anytype, msg: types.Message) !bool {
+fn normalizeToolCallId(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer out.deinit();
+
+    const max_len: usize = 64;
+    for (id) |c| {
+        if (out.items.len >= max_len) break;
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
+            try out.append(c);
+        } else {
+            try out.append('_');
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn appendAssistantToolCalls(allocator: std.mem.Allocator, writer: anytype, msg: types.Message) !bool {
     const tool_calls = msg.tool_calls orelse return false;
     if (tool_calls.len == 0) return false;
     for (tool_calls, 0..) |tc, i| {
+        const normalized_id = try normalizeToolCallId(allocator, tc.id);
+        defer allocator.free(normalized_id);
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"toolUse\":{\"toolUseId\":");
-        try writeJson(writer, tc.id);
+        try writeJson(writer, normalized_id);
         try writer.writeAll(",\"name\":");
         try writeJson(writer, tc.name);
         try writer.writeAll(",\"input\":");
@@ -557,21 +575,50 @@ fn buildConverseBody(
     defer prepared_messages.deinit();
 
     var first_message = true;
-    for (prepared_messages.items) |msg| {
+    var i: usize = 0;
+    while (i < prepared_messages.items.len) : (i += 1) {
+        const msg = prepared_messages.items[i];
         if (msg.role == .system) continue;
-        if (!first_message) try body.writer().writeByte(',');
-        first_message = false;
 
         if (msg.role == .tool or msg.role == .tool_result) {
-            try body.writer().writeAll("{\"role\":\"user\",\"content\":[{\"toolResult\":{\"toolUseId\":");
-            try writeJson(body.writer(), msg.tool_call_id orelse "");
-            try body.writer().writeAll(",\"content\":[{\"text\":");
-            _ = try appendMessageText(allocator, msg, body.writer());
-            try body.writer().writeAll("}],\"status\":");
-            try writeJson(body.writer(), if (msg.is_error) "error" else "success");
-            try body.writer().writeAll("}}]}");
+            if (!first_message) try body.writer().writeByte(',');
+            first_message = false;
+
+            try body.writer().writeAll("{\"role\":\"user\",\"content\":[");
+            var first_tool_result = true;
+            var j = i;
+            while (j < prepared_messages.items.len) : (j += 1) {
+                const tool_msg = prepared_messages.items[j];
+                if (!(tool_msg.role == .tool or tool_msg.role == .tool_result)) break;
+
+                const normalized_id = try normalizeToolCallId(allocator, tool_msg.tool_call_id orelse "");
+                defer allocator.free(normalized_id);
+                if (!first_tool_result) try body.writer().writeByte(',');
+                first_tool_result = false;
+                try body.writer().writeAll("{\"toolResult\":{\"toolUseId\":");
+                try writeJson(body.writer(), normalized_id);
+                try body.writer().writeAll(",\"content\":[{\"text\":");
+                if (!(try appendMessageText(allocator, tool_msg, body.writer()))) {
+                    try writeJson(body.writer(), "");
+                }
+                try body.writer().writeAll("}],\"status\":");
+                try writeJson(body.writer(), if (tool_msg.is_error) "error" else "success");
+                try body.writer().writeAll("}}");
+            }
+            try body.writer().writeAll("]}");
+            i = j - 1;
             continue;
         }
+
+        var text_preview = std.array_list.Managed(u8).init(allocator);
+        defer text_preview.deinit();
+        try transform.appendMessageTextToWriter(msg, text_preview.writer());
+        const has_non_empty_text = text_preview.items.len > 0;
+        const has_tool_calls = msg.role == .assistant and msg.tool_calls != null and msg.tool_calls.?.len > 0;
+        if (!has_non_empty_text and !has_tool_calls) continue;
+
+        if (!first_message) try body.writer().writeByte(',');
+        first_message = false;
 
         try body.writer().writeAll("{\"role\":");
         try writeJson(body.writer(), if (msg.role == .assistant) "assistant" else "user");
@@ -579,13 +626,15 @@ fn buildConverseBody(
 
         var wrote_any = false;
         if (msg.role == .assistant) {
-            wrote_any = try appendAssistantToolCalls(body.writer(), msg);
+            wrote_any = try appendAssistantToolCalls(allocator, body.writer(), msg);
             if (wrote_any) try body.writer().writeByte(',');
         }
 
         try body.writer().writeAll("{\"text\":");
-        if (!(try appendMessageText(allocator, msg, body.writer()))) {
+        if (!has_non_empty_text) {
             try writeJson(body.writer(), "");
+        } else {
+            try writeJson(body.writer(), text_preview.items);
         }
         try body.writer().writeAll("}]}");
     }
@@ -622,8 +671,8 @@ fn buildConverseBody(
 
     if (context.tools) |tools| {
         try body.writer().writeAll(",\"toolConfig\":{\"tools\":[");
-        for (tools, 0..) |tool, i| {
-            if (i > 0) try body.writer().writeByte(',');
+        for (tools, 0..) |tool, tool_i| {
+            if (tool_i > 0) try body.writer().writeByte(',');
             try body.writer().writeAll("{\"toolSpec\":{\"name\":");
             try writeJson(body.writer(), tool.name);
             try body.writer().writeAll(",\"description\":");
@@ -727,6 +776,15 @@ fn usageInt(v: std.json.Value) ?u32 {
 fn parseEventPayload(allocator: std.mem.Allocator, payload: []const u8) !?std.json.Parsed(std.json.Value) {
     if (payload.len == 0) return null;
     return std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch null;
+}
+
+fn exceptionPrefixForEventType(event_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, event_type, "internalServerException")) return "Internal server error";
+    if (std.mem.eql(u8, event_type, "modelStreamErrorException")) return "Model stream error";
+    if (std.mem.eql(u8, event_type, "validationException")) return "Validation error";
+    if (std.mem.eql(u8, event_type, "throttlingException")) return "Throttling error";
+    if (std.mem.eql(u8, event_type, "serviceUnavailableException")) return "Service unavailable";
+    return "Bedrock stream exception";
 }
 
 fn parseConverseEventStreamResponse(
@@ -1038,10 +1096,12 @@ fn parseConverseEventStreamResponse(
                     }
                 }
             } else if (std.mem.endsWith(u8, kind, "Exception")) {
+                const prefix = exceptionPrefixForEventType(kind);
                 if (root == .object and root.object.get("message") != null and root.object.get("message").? == .string) {
-                    try events.append(.{ .err = try allocator.dupe(u8, root.object.get("message").?.string) });
+                    const message = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, root.object.get("message").?.string });
+                    try events.append(.{ .err = message });
                 } else {
-                    try events.append(.{ .err = try allocator.dupe(u8, "Bedrock stream exception") });
+                    try events.append(.{ .err = try allocator.dupe(u8, prefix) });
                 }
                 return;
             }
@@ -1360,6 +1420,66 @@ test "bedrock thinking budget mapping" {
     try std.testing.expectEqual(@as(u32, 16384), thinkingBudget("xhigh"));
 }
 
+test "bedrock normalize tool call id mirrors ts behavior" {
+    const allocator = std.testing.allocator;
+    const raw = "tool id:/with spaces and*symbols that should be normalized and truncated 0123456789";
+    const normalized = try normalizeToolCallId(allocator, raw);
+    defer allocator.free(normalized);
+
+    try std.testing.expect(normalized.len <= 64);
+    try std.testing.expect(std.mem.indexOfAny(u8, normalized, " :/*") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, normalized, '_') != null);
+}
+
+test "bedrock request body batches tool results and sanitizes ids" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const assistant_tool_calls = [_]types.ToolCall{
+        .{ .id = "bad id/1", .name = "sum", .arguments_json = "{\"a\":1}" },
+    };
+    const messages = [_]types.Message{
+        .{
+            .role = .assistant,
+            .tool_calls = &assistant_tool_calls,
+        },
+        .{
+            .role = .tool_result,
+            .tool_call_id = "tool call/one",
+            .content = "first",
+        },
+        .{
+            .role = .tool_result,
+            .tool_call_id = "tool-call:two",
+            .content = "second",
+            .is_error = true,
+        },
+    };
+    const context: types.Context = .{
+        .messages = &messages,
+    };
+
+    const body = try buildConverseBody(allocator, model, context, .{});
+    defer allocator.free(body);
+
+    const grouped_tool_results =
+        "\"role\":\"user\",\"content\":[{\"toolResult\":{\"toolUseId\":\"tool_call_one\"" ++
+        ",\"content\":[{\"text\":\"first\"}],\"status\":\"success\"}},{\"toolResult\":{\"toolUseId\":\"tool-call_two\"" ++
+        ",\"content\":[{\"text\":\"second\"}],\"status\":\"error\"}}]";
+    try std.testing.expect(std.mem.indexOf(u8, body, grouped_tool_results) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"toolUseId\":\"bad_id_1\"") != null);
+}
+
 test "bedrock response parser emits text and tool events" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
@@ -1592,6 +1712,66 @@ test "bedrock eventstream parser emits streaming events" {
             try std.testing.expectEqual(@as(u32, 2), msg.usage.output);
             try std.testing.expectEqual(@as(u32, 3), msg.usage.total_tokens);
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "bedrock eventstream parser maps exception events to descriptive errors" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const f = try buildEventStreamFrame(
+        allocator,
+        "throttlingException",
+        "{\"message\":\"too many requests\"}",
+    );
+    defer allocator.free(f);
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |v| allocator.free(v.delta),
+                .text_end => |v| allocator.free(v.content),
+                .thinking_delta => |v| allocator.free(v.delta),
+                .thinking_end => |v| allocator.free(v.content),
+                .toolcall_delta => |v| allocator.free(v.delta),
+                .toolcall_end => |v| {
+                    allocator.free(v.tool_call.id);
+                    allocator.free(v.tool_call.name);
+                    allocator.free(v.tool_call.arguments_json);
+                },
+                .done => |v| {
+                    allocator.free(v.text);
+                    allocator.free(v.thinking);
+                    for (v.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    allocator.free(v.tool_calls);
+                },
+                .err => |v| allocator.free(v),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseConverseEventStreamResponse(allocator, f, model, &events);
+    try std.testing.expect(events.items.len >= 1);
+    switch (events.items[events.items.len - 1]) {
+        .err => |msg| try std.testing.expectEqualStrings("Throttling error: too many requests", msg),
         else => return error.TestUnexpectedResult,
     }
 }
