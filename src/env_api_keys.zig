@@ -141,7 +141,7 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
             return null;
         };
     }
-    return null;
+    return provider_oauth.getPiApiKeyEntry(allocator, provider);
 }
 
 test "getEnvApiKey returns azure openai api key" {

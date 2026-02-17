@@ -15,6 +15,7 @@ Initial Zig port of `pi-mono/packages/ai`.
 - `env_api_keys.zig` resolves provider credentials from environment variables whenever possible.
 - OAuth-backed providers also read `~/.pi/agent/auth.json` entries (`type: "oauth"`) with refresh-on-expiry parity for `openai-codex`, `anthropic`, `github-copilot`, `google-gemini-cli`, and `google-antigravity`.
 - Google OAuth refresh from `~/.pi/agent/auth.json` uses env-provided OAuth client credentials when needed: `GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID` + `GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET` (and Antigravity equivalents).
+- `~/.pi/agent/auth.json` `type: "api_key"` entries are also used as a generic final fallback for provider key resolution.
 - The `openai` and `openai-responses` providers require `OPENAI_API_KEY` (or the equivalent entry in a `.env`) so the mock server can validate requests during integration tests.
 - The `openai-codex` provider prefers `OPENAI_CODEX_API_KEY` and otherwise falls back to the OAuth tokens stored in `~/.codex/auth.json` (the same file the Codex browser flow populates). It also accepts `OPENAI_API_KEY` as a final fallback.
 - `kimi-code` and `kimi-coding` use `KIMICODE_API_KEY`, with `KIMI_API_KEY` and `ANTHROPIC_API_KEY` as secondary fallbacks, so you can reuse an Anthropic key if needed.

@@ -45,6 +45,29 @@ fn duplicateJsonString(allocator: std.mem.Allocator, obj: std.json.ObjectMap, ke
     return allocator.dupe(u8, v.string) catch null;
 }
 
+fn readApiKeyEntryFromFile(
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+    provider: []const u8,
+) ?[]const u8 {
+    const file = std.fs.openFileAbsolute(auth_path, .{ .mode = .read_only }) catch return null;
+    defer file.close();
+
+    const contents = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+    defer allocator.free(contents);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const provider_v = parsed.value.object.get(provider) orelse return null;
+    if (provider_v != .object) return null;
+    const entry = provider_v.object;
+    const type_v = entry.get("type") orelse return null;
+    if (type_v != .string or !std.mem.eql(u8, type_v.string, "api_key")) return null;
+    return duplicateJsonString(allocator, entry, "key");
+}
+
 pub fn piAuthPathFromHome(allocator: std.mem.Allocator, home: []const u8) ?[]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/.pi/agent/auth.json", .{home}) catch null;
 }
@@ -392,6 +415,14 @@ pub fn getPiOAuthApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]c
     return getPiOAuthApiKeyFromPath(allocator, provider, auth_path);
 }
 
+pub fn getPiApiKeyEntry(allocator: std.mem.Allocator, provider: []const u8) ?[]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home);
+    const auth_path = piAuthPathFromHome(allocator, home) orelse return null;
+    defer allocator.free(auth_path);
+    return readApiKeyEntryFromFile(allocator, auth_path, provider);
+}
+
 pub fn getPiOAuthApiKeyFromPath(
     allocator: std.mem.Allocator,
     provider: []const u8,
@@ -458,4 +489,29 @@ test "pi oauth resolves openai-codex token from auth storage" {
     const api_key = getPiOAuthApiKeyFromPath(allocator, "openai-codex", full_path) orelse return error.TestExpectedEqual;
     defer allocator.free(api_key);
     try std.testing.expectEqualStrings("codex-access", api_key);
+}
+
+test "pi auth resolves api_key credential entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".pi/agent");
+    const file = try tmp.dir.createFile(".pi/agent/auth.json", .{});
+    defer file.close();
+    try file.writeAll(
+        \\{"openrouter":{"type":"api_key","key":"sk-openrouter-test"}}
+    );
+
+    const cwd_realpath = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_realpath);
+    const full_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/.pi/agent/auth.json",
+        .{ cwd_realpath, tmp.sub_path },
+    );
+    defer allocator.free(full_path);
+
+    const key = readApiKeyEntryFromFile(allocator, full_path, "openrouter") orelse return error.TestExpectedEqual;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("sk-openrouter-test", key);
 }
