@@ -13,6 +13,8 @@ const supportedProviderKeys = new Set([
   'azure-openai-responses',
   'anthropic',
   'google',
+  'google-gemini-cli',
+  'google-vertex',
   'amazon-bedrock',
   'kimi-coding',
 ]);

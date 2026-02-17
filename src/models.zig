@@ -242,6 +242,8 @@ test "registerDefaultModels includes openai-codex variants" {
     const spark = registry.getModel("openai-codex", "gpt-5.3-codex-spark");
     const chatgpt_spark = registry.getModel("openai-codex-spark", "chatgpt5.3-spark");
     const google = registry.getModel("google", "gemini-2.5-pro");
+    const google_cli = registry.getModel("google-gemini-cli", "gemini-2.5-pro");
+    const google_vertex = registry.getModel("google-vertex", "gemini-2.5-pro");
     const bedrock = registry.getModel("amazon-bedrock", "anthropic.claude-3-7-sonnet-20250219-v1:0");
 
     try std.testing.expect(mini != null);
@@ -251,6 +253,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(spark != null);
     try std.testing.expect(chatgpt_spark != null);
     try std.testing.expect(google != null);
+    try std.testing.expect(google_cli != null);
+    try std.testing.expect(google_vertex != null);
     try std.testing.expect(bedrock != null);
     try std.testing.expect(std.mem.eql(u8, mini.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, v5_1.?.provider, "openai-codex"));
@@ -258,6 +262,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(std.mem.eql(u8, spark.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, chatgpt_spark.?.provider, "openai-codex-spark"));
     try std.testing.expect(std.mem.eql(u8, google.?.api, "google-generative-ai"));
+    try std.testing.expect(std.mem.eql(u8, google_cli.?.api, "google-gemini-cli"));
+    try std.testing.expect(std.mem.eql(u8, google_vertex.?.api, "google-vertex"));
     try std.testing.expect(std.mem.eql(u8, bedrock.?.api, "bedrock-converse-stream"));
 }
 

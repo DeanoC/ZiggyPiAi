@@ -2,6 +2,9 @@ const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
 
+const service_name = "bedrock";
+const authenticated_placeholder = "<authenticated>";
+
 fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
 }
@@ -17,6 +20,167 @@ fn readAllResponseBody(reader: *std.Io.Reader, out: *std.array_list.Managed(u8))
 
 fn appendHeader(headers: *std.array_list.Managed(std.http.Header), name: []const u8, value: []const u8) !void {
     try headers.append(.{ .name = name, .value = value });
+}
+
+fn isAuthenticatedPlaceholder(value: []const u8) bool {
+    return std.mem.eql(u8, value, authenticated_placeholder);
+}
+
+fn deriveRegionFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const fallback = "us-east-1";
+    const uri = std.Uri.parse(base_url) catch return allocator.dupe(u8, fallback);
+    var host_buf: [256]u8 = undefined;
+    const host = uri.getHost(&host_buf) catch return allocator.dupe(u8, fallback);
+
+    var it = std.mem.splitScalar(u8, host, '.');
+    const first = it.next() orelse return allocator.dupe(u8, fallback);
+    const second = it.next() orelse return allocator.dupe(u8, fallback);
+
+    if (!std.mem.startsWith(u8, first, "bedrock-runtime")) return allocator.dupe(u8, fallback);
+    if (second.len == 0) return allocator.dupe(u8, fallback);
+    return allocator.dupe(u8, second);
+}
+
+fn buildAmzDate(timestamp_secs: u64, amz_date: *[16]u8, date_stamp: *[8]u8) !void {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp_secs };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    _ = try std.fmt.bufPrint(
+        amz_date,
+        "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+    _ = try std.fmt.bufPrint(
+        date_stamp,
+        "{d:0>4}{d:0>2}{d:0>2}",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+        },
+    );
+}
+
+fn sha256Hex(input: []const u8, out: *[64]u8) !void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input, &digest, .{});
+    _ = try std.fmt.bufPrint(out, "{x}", .{&digest});
+}
+
+fn hmacSha256(key: []const u8, message: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&out, message, key);
+    return out;
+}
+
+const SigV4Auth = struct {
+    authorization: []const u8,
+    amz_date: []const u8,
+    payload_sha256: []const u8,
+    signed_headers: []const u8,
+};
+
+fn buildSigV4Authorization(
+    allocator: std.mem.Allocator,
+    auth_buf: []u8,
+    amz_date_storage: *[16]u8,
+    payload_hash_storage: *[64]u8,
+    endpoint_uri: std.Uri,
+    body: []const u8,
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+    session_token: ?[]const u8,
+    region: []const u8,
+    timestamp_secs: u64,
+) !SigV4Auth {
+    var host_buf: [256]u8 = undefined;
+    const host = try endpoint_uri.getHost(&host_buf);
+    const canonical_uri = switch (endpoint_uri.path) {
+        .raw => |v| if (v.len > 0) v else "/",
+        .percent_encoded => |v| if (v.len > 0) v else "/",
+    };
+
+    var date_stamp_storage: [8]u8 = undefined;
+    try buildAmzDate(timestamp_secs, amz_date_storage, &date_stamp_storage);
+
+    try sha256Hex(body, payload_hash_storage);
+
+    const signed_headers = if (session_token != null)
+        "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+    else
+        "host;x-amz-content-sha256;x-amz-date";
+
+    const canonical_headers = if (session_token) |token|
+        try std.fmt.allocPrint(
+            allocator,
+            "host:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\nx-amz-security-token:{s}\n",
+            .{ host, payload_hash_storage, amz_date_storage, token },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "host:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\n",
+            .{ host, payload_hash_storage, amz_date_storage },
+        );
+    defer allocator.free(canonical_headers);
+
+    const canonical_request = try std.fmt.allocPrint(
+        allocator,
+        "POST\n{s}\n\n{s}\n{s}\n{s}",
+        .{ canonical_uri, canonical_headers, signed_headers, payload_hash_storage },
+    );
+    defer allocator.free(canonical_request);
+
+    var canonical_request_hash: [64]u8 = undefined;
+    try sha256Hex(canonical_request, &canonical_request_hash);
+
+    var credential_scope_buf: [96]u8 = undefined;
+    const credential_scope = try std.fmt.bufPrint(
+        &credential_scope_buf,
+        "{s}/{s}/{s}/aws4_request",
+        .{ date_stamp_storage, region, service_name },
+    );
+
+    const string_to_sign = try std.fmt.allocPrint(
+        allocator,
+        "AWS4-HMAC-SHA256\n{s}\n{s}\n{s}",
+        .{ amz_date_storage, credential_scope, canonical_request_hash },
+    );
+    defer allocator.free(string_to_sign);
+
+    const secret_prefix = try std.fmt.allocPrint(allocator, "AWS4{s}", .{secret_access_key});
+    defer allocator.free(secret_prefix);
+    const k_date = hmacSha256(secret_prefix, &date_stamp_storage);
+    const k_region = hmacSha256(&k_date, region);
+    const k_service = hmacSha256(&k_region, service_name);
+    const k_signing = hmacSha256(&k_service, "aws4_request");
+    const signature = hmacSha256(&k_signing, string_to_sign);
+
+    var signature_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&signature_hex, "{x}", .{&signature});
+
+    const authorization = try std.fmt.bufPrint(
+        auth_buf,
+        "AWS4-HMAC-SHA256 Credential={s}/{s}, SignedHeaders={s}, Signature={s}",
+        .{ access_key_id, credential_scope, signed_headers, signature_hex },
+    );
+
+    return .{
+        .authorization = authorization,
+        .amz_date = amz_date_storage,
+        .payload_sha256 = payload_hash_storage,
+        .signed_headers = signed_headers,
+    };
 }
 
 fn mapStopReason(reason: []const u8) types.StopReason {
@@ -322,8 +486,6 @@ pub fn streamBedrockConverseStream(
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    const api_key = options.api_key orelse return error.MissingApiKey;
-
     const endpoint = try std.fmt.allocPrint(
         allocator,
         "{s}/model/{s}/converse",
@@ -337,9 +499,58 @@ pub fn streamBedrockConverseStream(
     var headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer headers.deinit();
 
-    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth);
-    try appendHeader(&headers, "Authorization", auth);
+    const api_key = options.api_key;
+    const use_bearer = api_key != null and !isAuthenticatedPlaceholder(api_key.?) and api_key.?.len > 0;
+
+    const aws_access_key_id = std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID") catch null;
+    defer if (aws_access_key_id) |v| allocator.free(v);
+    const aws_secret_access_key = std.process.getEnvVarOwned(allocator, "AWS_SECRET_ACCESS_KEY") catch null;
+    defer if (aws_secret_access_key) |v| allocator.free(v);
+    const aws_session_token = std.process.getEnvVarOwned(allocator, "AWS_SESSION_TOKEN") catch null;
+    defer if (aws_session_token) |v| allocator.free(v);
+    const aws_region = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch
+        std.process.getEnvVarOwned(allocator, "AWS_DEFAULT_REGION") catch null;
+    defer if (aws_region) |v| allocator.free(v);
+
+    var sigv4_auth_buf: [1024]u8 = undefined;
+    var sigv4_amz_date_buf: [16]u8 = undefined;
+    var sigv4_payload_sha_buf: [64]u8 = undefined;
+    const endpoint_uri = try std.Uri.parse(endpoint);
+    if (use_bearer) {
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
+        defer allocator.free(auth);
+        try appendHeader(&headers, "Authorization", auth);
+    } else if (aws_access_key_id != null and aws_secret_access_key != null) {
+        const region_owned = if (aws_region) |region|
+            try allocator.dupe(u8, region)
+        else
+            try deriveRegionFromBaseUrl(allocator, model.base_url);
+        defer allocator.free(region_owned);
+
+        const now_ts: u64 = @intCast(std.time.timestamp());
+        const sigv4 = try buildSigV4Authorization(
+            allocator,
+            &sigv4_auth_buf,
+            &sigv4_amz_date_buf,
+            &sigv4_payload_sha_buf,
+            endpoint_uri,
+            body,
+            aws_access_key_id.?,
+            aws_secret_access_key.?,
+            aws_session_token,
+            region_owned,
+            now_ts,
+        );
+        try appendHeader(&headers, "authorization", sigv4.authorization);
+        try appendHeader(&headers, "x-amz-date", sigv4.amz_date);
+        try appendHeader(&headers, "x-amz-content-sha256", sigv4.payload_sha256);
+        if (aws_session_token) |token| {
+            try appendHeader(&headers, "x-amz-security-token", token);
+        }
+    } else {
+        return error.MissingApiKey;
+    }
+
     try appendHeader(&headers, "content-type", "application/json");
     try appendHeader(&headers, "accept", "application/json");
 
@@ -347,7 +558,7 @@ pub fn streamBedrockConverseStream(
         for (custom_headers) |header| try appendHeader(&headers, header.name, header.value);
     }
 
-    var req = try client.request(.POST, try std.Uri.parse(endpoint), .{ .extra_headers = headers.items });
+    var req = try client.request(.POST, endpoint_uri, .{ .extra_headers = headers.items });
     defer req.deinit();
 
     const body_mut = try allocator.dupe(u8, body);
@@ -431,4 +642,38 @@ test "bedrock response parser emits text and tool events" {
 
     try parseConverseResponse(allocator, payload, model, &events);
     try std.testing.expect(events.items.len >= 5);
+}
+
+test "bedrock region derivation from base url" {
+    const allocator = std.testing.allocator;
+    const derived = try deriveRegionFromBaseUrl(allocator, "https://bedrock-runtime.us-west-2.amazonaws.com");
+    defer allocator.free(derived);
+    try std.testing.expectEqualStrings("us-west-2", derived);
+}
+
+test "bedrock sigv4 authorization shape" {
+    const allocator = std.testing.allocator;
+    const endpoint_uri = try std.Uri.parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse");
+    var auth_buf: [1024]u8 = undefined;
+    var amz_date_buf: [16]u8 = undefined;
+    var payload_sha_buf: [64]u8 = undefined;
+    const sig = try buildSigV4Authorization(
+        allocator,
+        &auth_buf,
+        &amz_date_buf,
+        &payload_sha_buf,
+        endpoint_uri,
+        "{\"messages\":[]}",
+        "AKIDEXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        null,
+        "us-east-1",
+        1_707_964_800,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, sig.authorization, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240215/us-east-1/bedrock/aws4_request"));
+    try std.testing.expect(std.mem.indexOf(u8, sig.authorization, "SignedHeaders=host;x-amz-content-sha256;x-amz-date") != null);
+    try std.testing.expect(sig.amz_date.len == 16);
+    try std.testing.expect(std.mem.startsWith(u8, sig.amz_date, "20240215T"));
+    try std.testing.expect(sig.amz_date[15] == 'Z');
+    try std.testing.expect(sig.payload_sha256.len == 64);
 }

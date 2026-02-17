@@ -45,4 +45,8 @@ done
 require_in_file ".id = \"chatgpt5.3-spark\"" "$ZIG_MODELS_FILE" "Zig spark alias"
 require_in_file ".provider = \"openai-codex-spark\"" "$ZIG_MODELS_FILE" "Zig spark provider"
 
+# Google provider parity aliases.
+require_in_file ".provider = \"google-gemini-cli\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated google-gemini-cli provider"
+require_in_file ".provider = \"google-vertex\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated google-vertex provider"
+
 echo "model-sync: OK"

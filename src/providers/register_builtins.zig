@@ -119,6 +119,16 @@ pub fn registerBuiltInApiProviders(api_registry: *registry.ApiRegistry) !void {
         .stream_simple = streamSimpleGoogleGenerativeAI,
     });
     try api_registry.register(.{
+        .api = "google-gemini-cli",
+        .stream = google.streamGoogleGenerativeAI,
+        .stream_simple = streamSimpleGoogleGenerativeAI,
+    });
+    try api_registry.register(.{
+        .api = "google-vertex",
+        .stream = google.streamGoogleGenerativeAI,
+        .stream_simple = streamSimpleGoogleGenerativeAI,
+    });
+    try api_registry.register(.{
         .api = "bedrock-converse-stream",
         .stream = bedrock.streamBedrockConverseStream,
         .stream_simple = streamSimpleBedrockConverseStream,
@@ -137,6 +147,8 @@ test "registerBuiltInApiProviders includes expected apis" {
     try std.testing.expect(api_registry.get("openai-codex-responses") != null);
     try std.testing.expect(api_registry.get("anthropic-messages") != null);
     try std.testing.expect(api_registry.get("google-generative-ai") != null);
+    try std.testing.expect(api_registry.get("google-gemini-cli") != null);
+    try std.testing.expect(api_registry.get("google-vertex") != null);
     try std.testing.expect(api_registry.get("bedrock-converse-stream") != null);
     try std.testing.expect(api_registry.get("openai-completions").?.stream_simple != null);
     try std.testing.expect(api_registry.get("openai-responses").?.stream_simple != null);
@@ -144,5 +156,7 @@ test "registerBuiltInApiProviders includes expected apis" {
     try std.testing.expect(api_registry.get("openai-codex-responses").?.stream_simple != null);
     try std.testing.expect(api_registry.get("anthropic-messages").?.stream_simple != null);
     try std.testing.expect(api_registry.get("google-generative-ai").?.stream_simple != null);
+    try std.testing.expect(api_registry.get("google-gemini-cli").?.stream_simple != null);
+    try std.testing.expect(api_registry.get("google-vertex").?.stream_simple != null);
     try std.testing.expect(api_registry.get("bedrock-converse-stream").?.stream_simple != null);
 }
