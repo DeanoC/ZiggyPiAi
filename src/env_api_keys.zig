@@ -78,6 +78,10 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "bedrock") or std.mem.eql(u8, provider, "amazon-bedrock") or std.mem.eql(u8, provider, "bedrock-converse-stream")) {
+        if (std.process.getEnvVarOwned(allocator, "AWS_PROFILE")) |profile| {
+            defer allocator.free(profile);
+            return allocator.dupe(u8, "<authenticated>") catch null;
+        } else |_| {}
         return std.process.getEnvVarOwned(allocator, "AWS_BEARER_TOKEN_BEDROCK") catch {
             const access = std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID") catch null;
             defer if (access) |v| allocator.free(v);
