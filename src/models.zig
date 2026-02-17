@@ -249,6 +249,8 @@ test "registerDefaultModels includes openai-codex variants" {
     const groq = registry.getModel("groq", "deepseek-r1-distill-llama-70b");
     const minimax = registry.getModel("minimax", "MiniMax-M2");
     const vercel_gateway = registry.getModel("vercel-ai-gateway", "alibaba/qwen-3-14b");
+    const antigravity = registry.getModel("google-antigravity", "claude-opus-4-5-thinking");
+    const github_copilot = registry.getModel("github-copilot", "claude-haiku-4.5");
 
     try std.testing.expect(mini != null);
     try std.testing.expect(v5_1 != null);
@@ -264,6 +266,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(groq != null);
     try std.testing.expect(minimax != null);
     try std.testing.expect(vercel_gateway != null);
+    try std.testing.expect(antigravity != null);
+    try std.testing.expect(github_copilot != null);
     try std.testing.expect(std.mem.eql(u8, mini.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, v5_1.?.provider, "openai-codex"));
     try std.testing.expect(std.mem.eql(u8, v5_2.?.provider, "openai-codex"));
@@ -277,6 +281,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(std.mem.eql(u8, groq.?.api, "openai-completions"));
     try std.testing.expect(std.mem.eql(u8, minimax.?.api, "anthropic-messages"));
     try std.testing.expect(std.mem.eql(u8, vercel_gateway.?.api, "anthropic-messages"));
+    try std.testing.expect(std.mem.eql(u8, antigravity.?.api, "google-gemini-cli"));
+    try std.testing.expect(std.mem.eql(u8, github_copilot.?.provider, "github-copilot"));
 }
 
 test "supportsXhigh matches TS behavior" {

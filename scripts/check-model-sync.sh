@@ -62,7 +62,9 @@ for provider in \
   "minimax" \
   "minimax-cn" \
   "opencode" \
-  "vercel-ai-gateway"
+  "vercel-ai-gateway" \
+  "google-antigravity" \
+  "github-copilot"
 do
   require_in_file ".provider = \"$provider\"" "$ZIG_MODELS_GENERATED_FILE" "Zig generated provider"
 done
