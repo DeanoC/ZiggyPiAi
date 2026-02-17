@@ -68,6 +68,23 @@ fn jsonObjectStringField(
     return null;
 }
 
+fn jsonNestedStringField(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    object_keys: []const []const u8,
+    value_keys: []const []const u8,
+) !?[]const u8 {
+    for (object_keys) |object_key| {
+        if (obj.get(object_key)) |nested| {
+            if (nested != .object) continue;
+            if (try jsonObjectStringField(allocator, nested.object, value_keys)) |value| {
+                return value;
+            }
+        }
+    }
+    return null;
+}
+
 fn parseGoogleCredentials(
     allocator: std.mem.Allocator,
     api_key_or_token: []const u8,
@@ -91,7 +108,8 @@ fn parseGoogleCredentials(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGoogleCredentials;
 
-    const token = (try jsonObjectStringField(allocator, parsed.value.object, &.{ "token", "access_token", "api_key" })) orelse
+    const token = (try jsonObjectStringField(allocator, parsed.value.object, &.{ "token", "access_token", "api_key" }) orelse
+        try jsonNestedStringField(allocator, parsed.value.object, &.{ "tokens", "oauth", "credentials" }, &.{ "access_token", "token" })) orelse
         return error.InvalidGoogleCredentials;
     errdefer allocator.free(token);
     const project_id = try jsonObjectStringField(allocator, parsed.value.object, &.{ "projectId", "project_id" });
@@ -535,6 +553,15 @@ test "parse google credentials supports oauth style field names" {
     try std.testing.expectEqualStrings("ya29.oauth", creds.token);
     try std.testing.expect(creds.project_id != null);
     try std.testing.expectEqualStrings("proj-123", creds.project_id.?);
+}
+
+test "parse google credentials supports nested oauth token payload" {
+    const allocator = std.testing.allocator;
+    var creds = try parseGoogleCredentials(allocator, "{\"tokens\":{\"access_token\":\"ya29.nested\"},\"projectId\":\"nested-proj\"}");
+    defer deinitGoogleCredentials(allocator, &creds);
+    try std.testing.expectEqualStrings("ya29.nested", creds.token);
+    try std.testing.expect(creds.project_id != null);
+    try std.testing.expectEqualStrings("nested-proj", creds.project_id.?);
 }
 
 test "containsCaseInsensitive matches mixed case substrings" {
