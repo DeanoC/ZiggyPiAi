@@ -102,6 +102,7 @@ fn resolveProjectId(allocator: std.mem.Allocator, creds: GoogleCredentials) !?[]
         return copied;
     }
     return std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
+        std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT_ID") catch
         std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null;
 }
 
@@ -119,15 +120,17 @@ fn writeGenerateRequestBody(
     writer: anytype,
     context: types.Context,
     options: types.StreamOptions,
+    include_system_prompt_in_contents: bool,
+    include_system_instruction: bool,
 ) !void {
     try writer.writeAll("{\"contents\":[");
     var first = true;
-    if (context.system_prompt) |sys| {
+    if (include_system_prompt_in_contents) if (context.system_prompt) |sys| {
         try writer.writeAll("{\"role\":\"user\",\"parts\":[{\"text\":");
         try writeJson(writer, sys);
         try writer.writeAll("}]}");
         first = false;
-    }
+    };
 
     for (context.messages) |msg| {
         if (msg.role != .user and msg.role != .assistant) continue;
@@ -141,6 +144,12 @@ fn writeGenerateRequestBody(
         try writer.writeAll("}]}");
     }
     try writer.writeAll("]");
+
+    if (include_system_instruction) if (context.system_prompt) |sys| {
+        try writer.writeAll(",\"systemInstruction\":{\"parts\":[{\"text\":");
+        try writeJson(writer, sys);
+        try writer.writeAll("}]}");
+    };
 
     if (context.tools) |tools| {
         try writer.writeAll(",\"tools\":[{\"functionDeclarations\":[");
@@ -204,7 +213,7 @@ pub fn streamGoogleGenerativeAI(
         defer allocator.free(endpoint_owned);
         try endpoint.appendSlice(endpoint_owned);
         try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try writeGenerateRequestBody(allocator, body.writer(), context, options, true, false);
         try body.writer().writeByte('}');
     } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
         var creds = try parseGoogleCredentials(allocator, api_key);
@@ -237,7 +246,7 @@ pub fn streamGoogleGenerativeAI(
         try body.writer().writeAll(",\"model\":");
         try writeJson(body.writer(), model.id);
         try body.writer().writeAll(",\"request\":{");
-        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try writeGenerateRequestBody(allocator, body.writer(), context, options, false, true);
         if (std.mem.eql(u8, model.provider, "google-antigravity")) {
             try body.writer().writeAll(",\"systemInstruction\":{\"role\":\"user\",\"parts\":[{\"text\":");
             try writeJson(body.writer(), antigravity_instruction);
@@ -276,7 +285,7 @@ pub fn streamGoogleGenerativeAI(
         defer allocator.free(endpoint_owned);
         try endpoint.appendSlice(endpoint_owned);
         try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try writeGenerateRequestBody(allocator, body.writer(), context, options, false, true);
         try body.writer().writeByte('}');
     } else {
         return error.ProviderNotSupported;
