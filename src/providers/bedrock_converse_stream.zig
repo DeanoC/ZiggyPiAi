@@ -154,6 +154,67 @@ fn loadAwsCredentialsFromProfile(allocator: std.mem.Allocator, profile: []const 
     };
 }
 
+fn loadAwsCredentialsFromContainer(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+) !?AwsCredentialsOwned {
+    const relative = std.process.getEnvVarOwned(allocator, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") catch null;
+    defer if (relative) |v| allocator.free(v);
+    const full = std.process.getEnvVarOwned(allocator, "AWS_CONTAINER_CREDENTIALS_FULL_URI") catch null;
+    defer if (full) |v| allocator.free(v);
+
+    const endpoint = if (relative) |path|
+        try std.fmt.allocPrint(allocator, "http://169.254.170.2{s}", .{path})
+    else if (full) |url|
+        try allocator.dupe(u8, url)
+    else
+        return null;
+    defer allocator.free(endpoint);
+
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    const auth_token = std.process.getEnvVarOwned(allocator, "AWS_CONTAINER_AUTHORIZATION_TOKEN") catch null;
+    defer if (auth_token) |v| allocator.free(v);
+    if (auth_token) |token| {
+        try appendHeader(&headers, "authorization", token);
+    }
+
+    var req = try client.request(.GET, try std.Uri.parse(endpoint), .{ .extra_headers = headers.items });
+    defer req.deinit();
+    try req.sendBodyComplete(&.{});
+
+    var redirect_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return null;
+
+    var response_buf = std.array_list.Managed(u8).init(allocator);
+    defer response_buf.deinit();
+    var transfer_buffer: [8192]u8 = undefined;
+    const response_reader = response.reader(&transfer_buffer);
+    try readAllResponseBody(response_reader, &response_buf);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf.items, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const access_v = parsed.value.object.get("AccessKeyId") orelse return null;
+    const secret_v = parsed.value.object.get("SecretAccessKey") orelse return null;
+    if (access_v != .string or secret_v != .string) return null;
+    if (access_v.string.len == 0 or secret_v.string.len == 0) return null;
+
+    const session = if (parsed.value.object.get("Token")) |token_v|
+        if (token_v == .string and token_v.string.len > 0) try allocator.dupe(u8, token_v.string) else null
+    else
+        null;
+
+    return .{
+        .access_key_id = try allocator.dupe(u8, access_v.string),
+        .secret_access_key = try allocator.dupe(u8, secret_v.string),
+        .session_token = session,
+        .region = null,
+    };
+}
+
 fn buildAmzDate(timestamp_secs: u64, amz_date: *[16]u8, date_stamp: *[8]u8) !void {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp_secs };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -685,6 +746,9 @@ pub fn streamBedrockConverseStream(
     defer if (shared_credentials) |*creds| creds.deinit(allocator);
     if (!use_bearer and (aws_access_key_id == null or aws_secret_access_key == null)) {
         shared_credentials = try loadAwsCredentialsFromProfile(allocator, aws_profile orelse "default");
+        if (shared_credentials == null) {
+            shared_credentials = try loadAwsCredentialsFromContainer(allocator, client);
+        }
     }
 
     var sigv4_auth_buf: [1024]u8 = undefined;
