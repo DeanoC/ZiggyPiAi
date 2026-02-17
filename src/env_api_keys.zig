@@ -29,10 +29,12 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
         return std.process.getEnvVarOwned(allocator, "OPENROUTER_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-generative-ai") or std.mem.eql(u8, provider, "google-gemini-cli")) {
-        return std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
+        return std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
+            std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
         return std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_API_KEY") catch
+            std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
     if (std.mem.eql(u8, provider, "bedrock") or std.mem.eql(u8, provider, "amazon-bedrock") or std.mem.eql(u8, provider, "bedrock-converse-stream")) {
