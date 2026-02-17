@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.1
       - name: Run Unit Test Suite
         run: zig build test
       - name: Run Targeted Integration Tests
