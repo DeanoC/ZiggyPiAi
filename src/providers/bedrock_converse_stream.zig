@@ -41,6 +41,119 @@ fn deriveRegionFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) !
     return allocator.dupe(u8, second);
 }
 
+const AwsCredentialsOwned = struct {
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+    session_token: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+
+    fn deinit(self: *AwsCredentialsOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.access_key_id);
+        allocator.free(self.secret_access_key);
+        if (self.session_token) |token| allocator.free(token);
+        if (self.region) |r| allocator.free(r);
+    }
+};
+
+fn sectionMatches(current: []const u8, sections: []const []const u8) bool {
+    for (sections) |section| {
+        if (std.mem.eql(u8, current, section)) return true;
+    }
+    return false;
+}
+
+fn parseIniValueForSections(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    sections: []const []const u8,
+    key: []const u8,
+) !?[]const u8 {
+    var current_section: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '#' or line[0] == ';') continue;
+
+        if (line[0] == '[' and line[line.len - 1] == ']') {
+            current_section = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+            continue;
+        }
+        const section = current_section orelse continue;
+        if (!sectionMatches(section, sections)) continue;
+
+        const split_at = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const parsed_key = std.mem.trim(u8, line[0..split_at], " \t");
+        if (!std.ascii.eqlIgnoreCase(parsed_key, key)) continue;
+
+        var value = std.mem.trim(u8, line[split_at + 1 ..], " \t");
+        if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) {
+            value = value[1 .. value.len - 1];
+        }
+        const out = try allocator.dupe(u8, value);
+        return out;
+    }
+    return null;
+}
+
+fn readFileIfExists(allocator: std.mem.Allocator, absolute_path: []const u8) !?[]const u8 {
+    const file = std.fs.openFileAbsolute(absolute_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    return try file.readToEndAlloc(allocator, 1024 * 1024);
+}
+
+fn loadAwsCredentialsFromProfile(allocator: std.mem.Allocator, profile: []const u8) !?AwsCredentialsOwned {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home);
+
+    const credentials_path = try std.fmt.allocPrint(allocator, "{s}/.aws/credentials", .{home});
+    defer allocator.free(credentials_path);
+
+    const credentials_file = try readFileIfExists(allocator, credentials_path) orelse return null;
+    defer allocator.free(credentials_file);
+
+    const credential_sections = [_][]const u8{profile};
+    const access = try parseIniValueForSections(allocator, credentials_file, &credential_sections, "aws_access_key_id") orelse return null;
+    errdefer allocator.free(access);
+    const secret = try parseIniValueForSections(allocator, credentials_file, &credential_sections, "aws_secret_access_key") orelse {
+        allocator.free(access);
+        return null;
+    };
+    errdefer allocator.free(secret);
+    const session = try parseIniValueForSections(allocator, credentials_file, &credential_sections, "aws_session_token");
+
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/.aws/config", .{home});
+    defer allocator.free(config_path);
+    const config_file = try readFileIfExists(allocator, config_path);
+    defer if (config_file) |v| allocator.free(v);
+
+    var profile_prefixed: ?[]u8 = null;
+    defer if (profile_prefixed) |v| allocator.free(v);
+    var region: ?[]const u8 = null;
+    if (config_file) |config_content| {
+        profile_prefixed = if (std.mem.eql(u8, profile, "default"))
+            try allocator.dupe(u8, "default")
+        else
+            try std.fmt.allocPrint(allocator, "profile {s}", .{profile});
+
+        const config_sections = [_][]const u8{
+            profile_prefixed.?,
+            profile,
+        };
+        region = try parseIniValueForSections(allocator, config_content, &config_sections, "region");
+    }
+
+    return .{
+        .access_key_id = access,
+        .secret_access_key = secret,
+        .session_token = session,
+        .region = region,
+    };
+}
+
 fn buildAmzDate(timestamp_secs: u64, amz_date: *[16]u8, date_stamp: *[8]u8) !void {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp_secs };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -511,8 +624,16 @@ pub fn streamBedrockConverseStream(
     const aws_region = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch
         std.process.getEnvVarOwned(allocator, "AWS_DEFAULT_REGION") catch null;
     defer if (aws_region) |v| allocator.free(v);
+    const aws_profile = std.process.getEnvVarOwned(allocator, "AWS_PROFILE") catch null;
+    defer if (aws_profile) |v| allocator.free(v);
     const aws_skip_auth = std.process.getEnvVarOwned(allocator, "AWS_BEDROCK_SKIP_AUTH") catch null;
     defer if (aws_skip_auth) |v| allocator.free(v);
+
+    var shared_credentials: ?AwsCredentialsOwned = null;
+    defer if (shared_credentials) |*creds| creds.deinit(allocator);
+    if (!use_bearer and (aws_access_key_id == null or aws_secret_access_key == null)) {
+        shared_credentials = try loadAwsCredentialsFromProfile(allocator, aws_profile orelse "default");
+    }
 
     var sigv4_auth_buf: [1024]u8 = undefined;
     var sigv4_amz_date_buf: [16]u8 = undefined;
@@ -524,9 +645,29 @@ pub fn streamBedrockConverseStream(
         try appendHeader(&headers, "Authorization", auth);
     } else if (aws_skip_auth != null and std.mem.eql(u8, aws_skip_auth.?, "1")) {
         // For proxy/gateway scenarios that do their own auth upstream.
-    } else if (aws_access_key_id != null and aws_secret_access_key != null) {
+    } else {
+        const sig_access = if (aws_access_key_id != null and aws_secret_access_key != null)
+            aws_access_key_id.?
+        else if (shared_credentials) |creds|
+            creds.access_key_id
+        else
+            return error.MissingApiKey;
+        const sig_secret = if (aws_access_key_id != null and aws_secret_access_key != null)
+            aws_secret_access_key.?
+        else if (shared_credentials) |creds|
+            creds.secret_access_key
+        else
+            return error.MissingApiKey;
+        const sig_session: ?[]const u8 = if (aws_session_token) |token|
+            token
+        else if (shared_credentials) |creds|
+            creds.session_token
+        else
+            null;
         const region_owned = if (aws_region) |region|
             try allocator.dupe(u8, region)
+        else if (shared_credentials) |creds|
+            if (creds.region) |r| try allocator.dupe(u8, r) else try deriveRegionFromBaseUrl(allocator, model.base_url)
         else
             try deriveRegionFromBaseUrl(allocator, model.base_url);
         defer allocator.free(region_owned);
@@ -539,20 +680,18 @@ pub fn streamBedrockConverseStream(
             &sigv4_payload_sha_buf,
             endpoint_uri,
             body,
-            aws_access_key_id.?,
-            aws_secret_access_key.?,
-            aws_session_token,
+            sig_access,
+            sig_secret,
+            sig_session,
             region_owned,
             now_ts,
         );
         try appendHeader(&headers, "authorization", sigv4.authorization);
         try appendHeader(&headers, "x-amz-date", sigv4.amz_date);
         try appendHeader(&headers, "x-amz-content-sha256", sigv4.payload_sha256);
-        if (aws_session_token) |token| {
+        if (sig_session) |token| {
             try appendHeader(&headers, "x-amz-security-token", token);
         }
-    } else {
-        return error.MissingApiKey;
     }
 
     try appendHeader(&headers, "content-type", "application/json");
@@ -653,6 +792,33 @@ test "bedrock region derivation from base url" {
     const derived = try deriveRegionFromBaseUrl(allocator, "https://bedrock-runtime.us-west-2.amazonaws.com");
     defer allocator.free(derived);
     try std.testing.expectEqualStrings("us-west-2", derived);
+}
+
+test "bedrock ini parser reads profile keys" {
+    const allocator = std.testing.allocator;
+    const ini =
+        \\[default]
+        \\aws_access_key_id = AKIADEFAULT
+        \\aws_secret_access_key = default-secret
+        \\
+        \\[dev]
+        \\aws_access_key_id = AKIADEV
+        \\aws_secret_access_key = dev-secret
+        \\
+        \\[profile dev]
+        \\region = us-west-2
+    ;
+    const sections = [_][]const u8{"dev"};
+    const access = try parseIniValueForSections(allocator, ini, &sections, "aws_access_key_id");
+    try std.testing.expect(access != null);
+    defer if (access) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("AKIADEV", access.?);
+
+    const config_sections = [_][]const u8{ "profile dev", "dev" };
+    const region = try parseIniValueForSections(allocator, ini, &config_sections, "region");
+    try std.testing.expect(region != null);
+    defer if (region) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("us-west-2", region.?);
 }
 
 test "bedrock sigv4 authorization shape" {
