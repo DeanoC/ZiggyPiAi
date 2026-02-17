@@ -257,7 +257,7 @@ fn loadVertexMetadataServerToken(allocator: std.mem.Allocator, client: *std.http
         .{ .extra_headers = headers.items },
     ) catch return null;
     defer req.deinit();
-    req.sendBodyComplete(&.{}) catch return null;
+    req.sendBodiless() catch return null;
 
     var redirect_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch return null;

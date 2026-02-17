@@ -118,13 +118,14 @@ fn parseExpiresInMs(expires_v: std.json.Value) !u64 {
 
 fn exchangeGoogleToken(
     allocator: std.mem.Allocator,
+    token_url: []const u8,
     body: []const u8,
     project_id: ?[]const u8,
 ) !OAuthCredentials {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    var req = try client.request(.POST, try std.Uri.parse("https://oauth2.googleapis.com/token"), .{
+    var req = try client.request(.POST, try std.Uri.parse(token_url), .{
         .extra_headers = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
     });
     defer req.deinit();
@@ -274,6 +275,154 @@ pub fn captureAuthorizationCodeViaCallback(
     return try allocator.dupe(u8, parsed.code.?);
 }
 
+fn exchangeGoogleAuthorizationCodeAt(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    client_id: []const u8,
+    client_secret: []const u8,
+    code: []const u8,
+    verifier: []const u8,
+    redirect_uri: []const u8,
+    project_id: ?[]const u8,
+) !OAuthCredentials {
+    const encoded_code = try urlEncode(allocator, code);
+    defer allocator.free(encoded_code);
+    const encoded_verifier = try urlEncode(allocator, verifier);
+    defer allocator.free(encoded_verifier);
+    const encoded_client_id = try urlEncode(allocator, client_id);
+    defer allocator.free(encoded_client_id);
+    const encoded_client_secret = try urlEncode(allocator, client_secret);
+    defer allocator.free(encoded_client_secret);
+    const encoded_redirect_uri = try urlEncode(allocator, redirect_uri);
+    defer allocator.free(encoded_redirect_uri);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "client_id={s}&client_secret={s}&code={s}&grant_type=authorization_code&redirect_uri={s}&code_verifier={s}",
+        .{ encoded_client_id, encoded_client_secret, encoded_code, encoded_redirect_uri, encoded_verifier },
+    );
+    defer allocator.free(body);
+    return exchangeGoogleToken(allocator, token_url, body, project_id);
+}
+
+fn refreshGoogleTokenAt(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    client_id: []const u8,
+    client_secret: []const u8,
+    refresh_token: []const u8,
+    project_id: []const u8,
+) !OAuthCredentials {
+    const encoded_client_id = try urlEncode(allocator, client_id);
+    defer allocator.free(encoded_client_id);
+    const encoded_client_secret = try urlEncode(allocator, client_secret);
+    defer allocator.free(encoded_client_secret);
+    const encoded_refresh = try urlEncode(allocator, refresh_token);
+    defer allocator.free(encoded_refresh);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "client_id={s}&client_secret={s}&refresh_token={s}&grant_type=refresh_token",
+        .{ encoded_client_id, encoded_client_secret, encoded_refresh },
+    );
+    defer allocator.free(body);
+    return exchangeGoogleToken(allocator, token_url, body, project_id);
+}
+
+fn exchangeAnthropicAuthorizationCodeAt(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    client_id: []const u8,
+    code: []const u8,
+    state: []const u8,
+    verifier: []const u8,
+    redirect_uri: []const u8,
+) !OAuthCredentials {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"grant_type\":\"authorization_code\",\"client_id\":\"{s}\",\"code\":\"{s}\",\"state\":\"{s}\",\"redirect_uri\":\"{s}\",\"code_verifier\":\"{s}\"}}",
+        .{ client_id, code, state, redirect_uri, verifier },
+    );
+    defer allocator.free(body);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    var req = try client.request(.POST, try std.Uri.parse(token_url), .{
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+    defer req.deinit();
+    const body_mut = try allocator.dupe(u8, body);
+    defer allocator.free(body_mut);
+    try req.sendBodyComplete(body_mut);
+
+    var redirect_buf: [1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return error.TokenExchangeFailed;
+
+    var transfer_buffer: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var raw = std.array_list.Managed(u8).init(allocator);
+    defer raw.deinit();
+    try readAllResponseBody(reader, &raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw.items, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TokenExchangeFailed;
+    const access_v = parsed.value.object.get("access_token") orelse return error.TokenExchangeFailed;
+    const refresh_v = parsed.value.object.get("refresh_token") orelse return error.TokenExchangeFailed;
+    const expires_v = parsed.value.object.get("expires_in") orelse return error.TokenExchangeFailed;
+    if (access_v != .string or refresh_v != .string) return error.TokenExchangeFailed;
+    return .{
+        .access = try allocator.dupe(u8, access_v.string),
+        .refresh = try allocator.dupe(u8, refresh_v.string),
+        .expires_at_ms = try parseExpiresInMs(expires_v),
+    };
+}
+
+fn refreshAnthropicTokenAt(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+) !OAuthCredentials {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"grant_type\":\"refresh_token\",\"client_id\":\"{s}\",\"refresh_token\":\"{s}\"}}",
+        .{ client_id, refresh_token },
+    );
+    defer allocator.free(body);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    var req = try client.request(.POST, try std.Uri.parse(token_url), .{
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+    defer req.deinit();
+    const body_mut = try allocator.dupe(u8, body);
+    defer allocator.free(body_mut);
+    try req.sendBodyComplete(body_mut);
+
+    var redirect_buf: [1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status != .ok) return error.TokenExchangeFailed;
+    var transfer_buffer: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var raw = std.array_list.Managed(u8).init(allocator);
+    defer raw.deinit();
+    try readAllResponseBody(reader, &raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw.items, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TokenExchangeFailed;
+    const access_v = parsed.value.object.get("access_token") orelse return error.TokenExchangeFailed;
+    const refresh_v = parsed.value.object.get("refresh_token") orelse return error.TokenExchangeFailed;
+    const expires_v = parsed.value.object.get("expires_in") orelse return error.TokenExchangeFailed;
+    if (access_v != .string or refresh_v != .string) return error.TokenExchangeFailed;
+    return .{
+        .access = try allocator.dupe(u8, access_v.string),
+        .refresh = try allocator.dupe(u8, refresh_v.string),
+        .expires_at_ms = try parseExpiresInMs(expires_v),
+    };
+}
+
 pub fn exchangeGoogleGeminiCliAuthorizationCode(
     allocator: std.mem.Allocator,
     code: []const u8,
@@ -283,27 +432,18 @@ pub fn exchangeGoogleGeminiCliAuthorizationCode(
     defer allocator.free(client_id);
     const client_secret = try getRequiredEnv(allocator, "GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET");
     defer allocator.free(client_secret);
-
-    const encoded_code = try urlEncode(allocator, code);
-    defer allocator.free(encoded_code);
-    const encoded_verifier = try urlEncode(allocator, verifier);
-    defer allocator.free(encoded_verifier);
-    const encoded_client_id = try urlEncode(allocator, client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_client_secret = try urlEncode(allocator, client_secret);
-    defer allocator.free(encoded_client_secret);
-    const encoded_redirect_uri = try urlEncode(allocator, "http://localhost:8085/oauth2callback");
-    defer allocator.free(encoded_redirect_uri);
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "client_id={s}&client_secret={s}&code={s}&grant_type=authorization_code&redirect_uri={s}&code_verifier={s}",
-        .{ encoded_client_id, encoded_client_secret, encoded_code, encoded_redirect_uri, encoded_verifier },
-    );
-    defer allocator.free(body);
     const project_id = getCloudProjectFromEnv(allocator);
     defer if (project_id) |p| allocator.free(p);
-    return exchangeGoogleToken(allocator, body, project_id);
+    return exchangeGoogleAuthorizationCodeAt(
+        allocator,
+        "https://oauth2.googleapis.com/token",
+        client_id,
+        client_secret,
+        code,
+        verifier,
+        "http://localhost:8085/oauth2callback",
+        project_id,
+    );
 }
 
 pub fn exchangeGoogleAntigravityAuthorizationCode(
@@ -316,26 +456,18 @@ pub fn exchangeGoogleAntigravityAuthorizationCode(
     const client_secret = try getRequiredEnv(allocator, "GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET");
     defer allocator.free(client_secret);
 
-    const encoded_code = try urlEncode(allocator, code);
-    defer allocator.free(encoded_code);
-    const encoded_verifier = try urlEncode(allocator, verifier);
-    defer allocator.free(encoded_verifier);
-    const encoded_client_id = try urlEncode(allocator, client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_client_secret = try urlEncode(allocator, client_secret);
-    defer allocator.free(encoded_client_secret);
-    const encoded_redirect_uri = try urlEncode(allocator, "http://localhost:51121/oauth-callback");
-    defer allocator.free(encoded_redirect_uri);
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "client_id={s}&client_secret={s}&code={s}&grant_type=authorization_code&redirect_uri={s}&code_verifier={s}",
-        .{ encoded_client_id, encoded_client_secret, encoded_code, encoded_redirect_uri, encoded_verifier },
-    );
-    defer allocator.free(body);
     const project_id = (getCloudProjectFromEnv(allocator) orelse try allocator.dupe(u8, "rising-fact-p41fc"));
     defer allocator.free(project_id);
-    return exchangeGoogleToken(allocator, body, project_id);
+    return exchangeGoogleAuthorizationCodeAt(
+        allocator,
+        "https://oauth2.googleapis.com/token",
+        client_id,
+        client_secret,
+        code,
+        verifier,
+        "http://localhost:51121/oauth-callback",
+        project_id,
+    );
 }
 
 pub fn refreshGoogleGeminiCliToken(allocator: std.mem.Allocator, refresh_token: []const u8, project_id: []const u8) !OAuthCredentials {
@@ -343,19 +475,14 @@ pub fn refreshGoogleGeminiCliToken(allocator: std.mem.Allocator, refresh_token: 
     defer allocator.free(client_id);
     const client_secret = try getRequiredEnv(allocator, "GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET");
     defer allocator.free(client_secret);
-    const encoded_client_id = try urlEncode(allocator, client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_client_secret = try urlEncode(allocator, client_secret);
-    defer allocator.free(encoded_client_secret);
-    const encoded_refresh = try urlEncode(allocator, refresh_token);
-    defer allocator.free(encoded_refresh);
-    const body = try std.fmt.allocPrint(
+    return refreshGoogleTokenAt(
         allocator,
-        "client_id={s}&client_secret={s}&refresh_token={s}&grant_type=refresh_token",
-        .{ encoded_client_id, encoded_client_secret, encoded_refresh },
+        "https://oauth2.googleapis.com/token",
+        client_id,
+        client_secret,
+        refresh_token,
+        project_id,
     );
-    defer allocator.free(body);
-    return exchangeGoogleToken(allocator, body, project_id);
 }
 
 pub fn refreshGoogleAntigravityToken(allocator: std.mem.Allocator, refresh_token: []const u8, project_id: []const u8) !OAuthCredentials {
@@ -363,19 +490,14 @@ pub fn refreshGoogleAntigravityToken(allocator: std.mem.Allocator, refresh_token
     defer allocator.free(client_id);
     const client_secret = try getRequiredEnv(allocator, "GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET");
     defer allocator.free(client_secret);
-    const encoded_client_id = try urlEncode(allocator, client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_client_secret = try urlEncode(allocator, client_secret);
-    defer allocator.free(encoded_client_secret);
-    const encoded_refresh = try urlEncode(allocator, refresh_token);
-    defer allocator.free(encoded_refresh);
-    const body = try std.fmt.allocPrint(
+    return refreshGoogleTokenAt(
         allocator,
-        "client_id={s}&client_secret={s}&refresh_token={s}&grant_type=refresh_token",
-        .{ encoded_client_id, encoded_client_secret, encoded_refresh },
+        "https://oauth2.googleapis.com/token",
+        client_id,
+        client_secret,
+        refresh_token,
+        project_id,
     );
-    defer allocator.free(body);
-    return exchangeGoogleToken(allocator, body, project_id);
 }
 
 pub fn exchangeAnthropicAuthorizationCode(
@@ -386,92 +508,26 @@ pub fn exchangeAnthropicAuthorizationCode(
 ) !OAuthCredentials {
     const client_id = try getRequiredEnv(allocator, "ANTHROPIC_OAUTH_CLIENT_ID");
     defer allocator.free(client_id);
-    const redirect_uri = "https://console.anthropic.com/oauth/code/callback";
-
-    const body = try std.fmt.allocPrint(
+    return exchangeAnthropicAuthorizationCodeAt(
         allocator,
-        "{{\"grant_type\":\"authorization_code\",\"client_id\":\"{s}\",\"code\":\"{s}\",\"state\":\"{s}\",\"redirect_uri\":\"{s}\",\"code_verifier\":\"{s}\"}}",
-        .{ client_id, code, state, redirect_uri, verifier },
+        "https://console.anthropic.com/v1/oauth/token",
+        client_id,
+        code,
+        state,
+        verifier,
+        "https://console.anthropic.com/oauth/code/callback",
     );
-    defer allocator.free(body);
-
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    var req = try client.request(.POST, try std.Uri.parse("https://console.anthropic.com/v1/oauth/token"), .{
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    });
-    defer req.deinit();
-    const body_mut = try allocator.dupe(u8, body);
-    defer allocator.free(body_mut);
-    try req.sendBodyComplete(body_mut);
-
-    var redirect_buf: [1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status != .ok) return error.TokenExchangeFailed;
-
-    var transfer_buffer: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    var raw = std.array_list.Managed(u8).init(allocator);
-    defer raw.deinit();
-    try readAllResponseBody(reader, &raw);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw.items, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.TokenExchangeFailed;
-    const access_v = parsed.value.object.get("access_token") orelse return error.TokenExchangeFailed;
-    const refresh_v = parsed.value.object.get("refresh_token") orelse return error.TokenExchangeFailed;
-    const expires_v = parsed.value.object.get("expires_in") orelse return error.TokenExchangeFailed;
-    if (access_v != .string or refresh_v != .string) return error.TokenExchangeFailed;
-
-    return .{
-        .access = try allocator.dupe(u8, access_v.string),
-        .refresh = try allocator.dupe(u8, refresh_v.string),
-        .expires_at_ms = try parseExpiresInMs(expires_v),
-    };
 }
 
 pub fn refreshAnthropicToken(allocator: std.mem.Allocator, refresh_token: []const u8) !OAuthCredentials {
     const client_id = try getRequiredEnv(allocator, "ANTHROPIC_OAUTH_CLIENT_ID");
     defer allocator.free(client_id);
-    const body = try std.fmt.allocPrint(
+    return refreshAnthropicTokenAt(
         allocator,
-        "{{\"grant_type\":\"refresh_token\",\"client_id\":\"{s}\",\"refresh_token\":\"{s}\"}}",
-        .{ client_id, refresh_token },
+        "https://console.anthropic.com/v1/oauth/token",
+        client_id,
+        refresh_token,
     );
-    defer allocator.free(body);
-
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-    var req = try client.request(.POST, try std.Uri.parse("https://console.anthropic.com/v1/oauth/token"), .{
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    });
-    defer req.deinit();
-    const body_mut = try allocator.dupe(u8, body);
-    defer allocator.free(body_mut);
-    try req.sendBodyComplete(body_mut);
-
-    var redirect_buf: [1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status != .ok) return error.TokenExchangeFailed;
-
-    var transfer_buffer: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    var raw = std.array_list.Managed(u8).init(allocator);
-    defer raw.deinit();
-    try readAllResponseBody(reader, &raw);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw.items, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.TokenExchangeFailed;
-    const access_v = parsed.value.object.get("access_token") orelse return error.TokenExchangeFailed;
-    const refresh_v = parsed.value.object.get("refresh_token") orelse return error.TokenExchangeFailed;
-    const expires_v = parsed.value.object.get("expires_in") orelse return error.TokenExchangeFailed;
-    if (access_v != .string or refresh_v != .string) return error.TokenExchangeFailed;
-    return .{
-        .access = try allocator.dupe(u8, access_v.string),
-        .refresh = try allocator.dupe(u8, refresh_v.string),
-        .expires_at_ms = try parseExpiresInMs(expires_v),
-    };
 }
 
 fn normalizeDomain(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -486,19 +542,17 @@ fn normalizeDomain(allocator: std.mem.Allocator, input: []const u8) ![]const u8 
     return allocator.dupe(u8, trimmed);
 }
 
-pub fn startGitHubCopilotDeviceFlow(allocator: std.mem.Allocator, enterprise_domain: ?[]const u8) !DeviceCodeFlow {
-    const client_id = std.process.getEnvVarOwned(allocator, "GITHUB_COPILOT_OAUTH_CLIENT_ID") catch try allocator.dupe(u8, "Iv1.b507a08c87ecfe98");
-    defer allocator.free(client_id);
-    const domain = try normalizeDomain(allocator, enterprise_domain orelse "github.com");
-    defer allocator.free(domain);
-    const url = try std.fmt.allocPrint(allocator, "https://{s}/login/device/code", .{domain});
-    defer allocator.free(url);
+fn startGitHubCopilotDeviceFlowAt(
+    allocator: std.mem.Allocator,
+    device_code_url: []const u8,
+    client_id: []const u8,
+) !DeviceCodeFlow {
     const body = try std.fmt.allocPrint(allocator, "{{\"client_id\":\"{s}\",\"scope\":\"read:user\"}}", .{client_id});
     defer allocator.free(body);
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
-    var req = try client.request(.POST, try std.Uri.parse(url), .{
+    var req = try client.request(.POST, try std.Uri.parse(device_code_url), .{
         .extra_headers = &.{
             .{ .name = "Accept", .value = "application/json" },
             .{ .name = "Content-Type", .value = "application/json" },
@@ -540,20 +594,24 @@ pub fn startGitHubCopilotDeviceFlow(allocator: std.mem.Allocator, enterprise_dom
     };
 }
 
-pub fn pollGitHubCopilotDeviceAccessToken(
-    allocator: std.mem.Allocator,
-    device_code: []const u8,
-    interval_seconds: u32,
-    expires_in_seconds: u32,
-    enterprise_domain: ?[]const u8,
-) ![]const u8 {
+pub fn startGitHubCopilotDeviceFlow(allocator: std.mem.Allocator, enterprise_domain: ?[]const u8) !DeviceCodeFlow {
     const client_id = std.process.getEnvVarOwned(allocator, "GITHUB_COPILOT_OAUTH_CLIENT_ID") catch try allocator.dupe(u8, "Iv1.b507a08c87ecfe98");
     defer allocator.free(client_id);
     const domain = try normalizeDomain(allocator, enterprise_domain orelse "github.com");
     defer allocator.free(domain);
-    const url = try std.fmt.allocPrint(allocator, "https://{s}/login/oauth/access_token", .{domain});
+    const url = try std.fmt.allocPrint(allocator, "https://{s}/login/device/code", .{domain});
     defer allocator.free(url);
+    return startGitHubCopilotDeviceFlowAt(allocator, url, client_id);
+}
 
+fn pollGitHubCopilotDeviceAccessTokenAt(
+    allocator: std.mem.Allocator,
+    access_token_url: []const u8,
+    client_id: []const u8,
+    device_code: []const u8,
+    interval_seconds: u32,
+    expires_in_seconds: u32,
+) ![]const u8 {
     const deadline_ms = @as(u64, @intCast(std.time.milliTimestamp())) + @as(u64, expires_in_seconds) * 1000;
     var interval_ms: u64 = @as(u64, interval_seconds) * 1000;
     while (@as(u64, @intCast(std.time.milliTimestamp())) < deadline_ms) {
@@ -566,7 +624,7 @@ pub fn pollGitHubCopilotDeviceAccessToken(
 
         var client = std.http.Client{ .allocator = allocator };
         defer client.deinit();
-        var req = try client.request(.POST, try std.Uri.parse(url), .{
+        var req = try client.request(.POST, try std.Uri.parse(access_token_url), .{
             .extra_headers = &.{
                 .{ .name = "Accept", .value = "application/json" },
                 .{ .name = "Content-Type", .value = "application/json" },
@@ -596,22 +654,39 @@ pub fn pollGitHubCopilotDeviceAccessToken(
         if (parsed.value.object.get("error")) |e| {
             if (e == .string and std.mem.eql(u8, e.string, "slow_down")) interval_ms += 5000;
         }
-        std.time.sleep(interval_ms * std.time.ns_per_ms);
+        std.Thread.sleep(interval_ms * std.time.ns_per_ms);
     }
     return error.TokenExchangeFailed;
 }
 
-pub fn refreshGitHubCopilotToken(allocator: std.mem.Allocator, refresh_token: []const u8, enterprise_domain: ?[]const u8) !OAuthCredentials {
+pub fn pollGitHubCopilotDeviceAccessToken(
+    allocator: std.mem.Allocator,
+    device_code: []const u8,
+    interval_seconds: u32,
+    expires_in_seconds: u32,
+    enterprise_domain: ?[]const u8,
+) ![]const u8 {
+    const client_id = std.process.getEnvVarOwned(allocator, "GITHUB_COPILOT_OAUTH_CLIENT_ID") catch try allocator.dupe(u8, "Iv1.b507a08c87ecfe98");
+    defer allocator.free(client_id);
     const domain = try normalizeDomain(allocator, enterprise_domain orelse "github.com");
     defer allocator.free(domain);
-    const url = try std.fmt.allocPrint(allocator, "https://api.{s}/copilot_internal/v2/token", .{domain});
+    const url = try std.fmt.allocPrint(allocator, "https://{s}/login/oauth/access_token", .{domain});
     defer allocator.free(url);
+    return pollGitHubCopilotDeviceAccessTokenAt(allocator, url, client_id, device_code, interval_seconds, expires_in_seconds);
+}
+
+fn refreshGitHubCopilotTokenAt(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    refresh_token: []const u8,
+    domain: []const u8,
+) !OAuthCredentials {
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{refresh_token});
     defer allocator.free(auth);
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
-    var req = try client.request(.GET, try std.Uri.parse(url), .{
+    var req = try client.request(.GET, try std.Uri.parse(token_url), .{
         .extra_headers = &.{
             .{ .name = "Accept", .value = "application/json" },
             .{ .name = "Authorization", .value = auth },
@@ -622,7 +697,7 @@ pub fn refreshGitHubCopilotToken(allocator: std.mem.Allocator, refresh_token: []
         },
     });
     defer req.deinit();
-    try req.sendBodyComplete(&.{});
+    try req.sendBodiless();
 
     var redirect_buf: [1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
@@ -645,4 +720,199 @@ pub fn refreshGitHubCopilotToken(allocator: std.mem.Allocator, refresh_token: []
         .expires_at_ms = @as(u64, @intCast(expires_v.integer)) * 1000 - 5 * 60 * 1000,
         .enterprise_url = try allocator.dupe(u8, domain),
     };
+}
+
+pub fn refreshGitHubCopilotToken(allocator: std.mem.Allocator, refresh_token: []const u8, enterprise_domain: ?[]const u8) !OAuthCredentials {
+    const domain = try normalizeDomain(allocator, enterprise_domain orelse "github.com");
+    defer allocator.free(domain);
+    const url = try std.fmt.allocPrint(allocator, "https://api.{s}/copilot_internal/v2/token", .{domain});
+    defer allocator.free(url);
+    return refreshGitHubCopilotTokenAt(allocator, url, refresh_token, domain);
+}
+
+const MockResponse = struct {
+    status: []const u8 = "200 OK",
+    body: []const u8,
+};
+
+const MockServerArgs = struct {
+    server: *std.net.Server,
+    ready: *std.atomic.Value(bool),
+    responses: []const MockResponse,
+};
+
+fn mockServerWorker(args: *MockServerArgs) void {
+    defer args.server.deinit();
+    args.ready.store(true, .seq_cst);
+
+    for (args.responses) |resp| {
+        const conn = args.server.accept() catch return;
+        defer conn.stream.close();
+        var read_buf: [4096]u8 = undefined;
+        _ = conn.stream.read(&read_buf) catch {};
+
+        var write_buf: [4096]u8 = undefined;
+        var writer = std.net.Stream.writer(conn.stream, &write_buf);
+        const w = &writer.interface;
+        w.writeAll("HTTP/1.1 ") catch return;
+        w.writeAll(resp.status) catch return;
+        w.writeAll("\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n") catch return;
+        w.writeAll(resp.body) catch return;
+        w.flush() catch return;
+    }
+}
+
+fn startMockServer(
+    allocator: std.mem.Allocator,
+    responses: []const MockResponse,
+) !struct {
+    thread: std.Thread,
+    url: []u8,
+    server_storage: *std.net.Server,
+    ready_ptr: *std.atomic.Value(bool),
+    args: *MockServerArgs,
+} {
+    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server_value = try std.net.Address.listen(listen_addr, .{});
+    const port = server_value.listen_address.getPort();
+
+    const server_storage = try allocator.create(std.net.Server);
+    server_storage.* = server_value;
+
+    const ready_ptr = try allocator.create(std.atomic.Value(bool));
+    ready_ptr.* = std.atomic.Value(bool).init(false);
+    const args = try allocator.create(MockServerArgs);
+    args.* = .{
+        .server = server_storage,
+        .ready = ready_ptr,
+        .responses = responses,
+    };
+
+    const thread = try std.Thread.spawn(.{}, mockServerWorker, .{args});
+    while (!ready_ptr.load(.seq_cst)) {
+        _ = std.Thread.yield() catch {};
+    }
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    return .{
+        .thread = thread,
+        .url = url,
+        .server_storage = server_storage,
+        .ready_ptr = ready_ptr,
+        .args = args,
+    };
+}
+
+test "oauth login helpers exchange and refresh against mocked endpoints" {
+    const allocator = std.testing.allocator;
+
+    const google_exchange_resp = [_]MockResponse{
+        .{ .body = "{\"access_token\":\"g-access\",\"refresh_token\":\"g-refresh\",\"expires_in\":3600}" },
+    };
+    var google_srv = try startMockServer(allocator, &google_exchange_resp);
+    defer {
+        google_srv.thread.join();
+        allocator.free(google_srv.url);
+        allocator.destroy(google_srv.server_storage);
+        allocator.destroy(google_srv.args);
+        allocator.destroy(google_srv.ready_ptr);
+    }
+    const google_token_url = try std.fmt.allocPrint(allocator, "{s}/token", .{google_srv.url});
+    defer allocator.free(google_token_url);
+    var g = try exchangeGoogleAuthorizationCodeAt(
+        allocator,
+        google_token_url,
+        "cid",
+        "csecret",
+        "code",
+        "verifier",
+        "http://localhost/cb",
+        "proj",
+    );
+    defer freeOAuthCredentials(allocator, &g);
+    try std.testing.expectEqualStrings("g-access", g.access);
+    try std.testing.expect(g.project_id != null);
+
+    const google_refresh_resp = [_]MockResponse{
+        .{ .body = "{\"access_token\":\"g2-access\",\"refresh_token\":\"g2-refresh\",\"expires_in\":3600}" },
+    };
+    var google_refresh_srv = try startMockServer(allocator, &google_refresh_resp);
+    defer {
+        google_refresh_srv.thread.join();
+        allocator.free(google_refresh_srv.url);
+        allocator.destroy(google_refresh_srv.server_storage);
+        allocator.destroy(google_refresh_srv.args);
+        allocator.destroy(google_refresh_srv.ready_ptr);
+    }
+    const google_refresh_url = try std.fmt.allocPrint(allocator, "{s}/token", .{google_refresh_srv.url});
+    defer allocator.free(google_refresh_url);
+    var g2 = try refreshGoogleTokenAt(allocator, google_refresh_url, "cid", "sec", "rt", "proj2");
+    defer freeOAuthCredentials(allocator, &g2);
+    try std.testing.expectEqualStrings("g2-access", g2.access);
+
+    const anthropic_resp = [_]MockResponse{
+        .{ .body = "{\"access_token\":\"a-access\",\"refresh_token\":\"a-refresh\",\"expires_in\":1800}" },
+    };
+    var a_srv = try startMockServer(allocator, &anthropic_resp);
+    defer {
+        a_srv.thread.join();
+        allocator.free(a_srv.url);
+        allocator.destroy(a_srv.server_storage);
+        allocator.destroy(a_srv.args);
+        allocator.destroy(a_srv.ready_ptr);
+    }
+    const anthropic_url = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{a_srv.url});
+    defer allocator.free(anthropic_url);
+    var a = try exchangeAnthropicAuthorizationCodeAt(allocator, anthropic_url, "acid", "code", "state", "verifier", "http://cb");
+    defer freeOAuthCredentials(allocator, &a);
+    try std.testing.expectEqualStrings("a-access", a.access);
+}
+
+test "github copilot oauth helpers work with mocked endpoints" {
+    const allocator = std.testing.allocator;
+
+    const device_and_poll = [_]MockResponse{
+        .{ .body = "{\"device_code\":\"dev\",\"user_code\":\"user\",\"verification_uri\":\"https://verify\",\"interval\":0,\"expires_in\":10}" },
+        .{ .body = "{\"error\":\"authorization_pending\"}" },
+        .{ .body = "{\"access_token\":\"gh-device-access\"}" },
+    };
+    var srv = try startMockServer(allocator, &device_and_poll);
+    defer {
+        srv.thread.join();
+        allocator.free(srv.url);
+        allocator.destroy(srv.server_storage);
+        allocator.destroy(srv.args);
+        allocator.destroy(srv.ready_ptr);
+    }
+    const device_url = try std.fmt.allocPrint(allocator, "{s}/device", .{srv.url});
+    defer allocator.free(device_url);
+    const poll_url = try std.fmt.allocPrint(allocator, "{s}/poll", .{srv.url});
+    defer allocator.free(poll_url);
+
+    var d = try startGitHubCopilotDeviceFlowAt(allocator, device_url, "cid");
+    defer freeDeviceCodeFlow(allocator, &d);
+    try std.testing.expectEqualStrings("dev", d.device_code);
+
+    const access = try pollGitHubCopilotDeviceAccessTokenAt(allocator, poll_url, "cid", d.device_code, 0, 10);
+    defer allocator.free(access);
+    try std.testing.expectEqualStrings("gh-device-access", access);
+
+    const refresh_resp = [_]MockResponse{
+        .{ .body = "{\"token\":\"copilot-token\",\"expires_at\":4102444800}" },
+    };
+    var refresh_srv = try startMockServer(allocator, &refresh_resp);
+    defer {
+        refresh_srv.thread.join();
+        allocator.free(refresh_srv.url);
+        allocator.destroy(refresh_srv.server_storage);
+        allocator.destroy(refresh_srv.args);
+        allocator.destroy(refresh_srv.ready_ptr);
+    }
+    const refresh_url = try std.fmt.allocPrint(allocator, "{s}/copilot", .{refresh_srv.url});
+    defer allocator.free(refresh_url);
+    var r = try refreshGitHubCopilotTokenAt(allocator, refresh_url, "refresh-token", "example.com");
+    defer freeOAuthCredentials(allocator, &r);
+    try std.testing.expectEqualStrings("copilot-token", r.access);
+    try std.testing.expect(r.enterprise_url != null);
+    try std.testing.expectEqualStrings("example.com", r.enterprise_url.?);
 }

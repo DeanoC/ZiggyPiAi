@@ -181,7 +181,7 @@ fn loadAwsCredentialsFromContainer(
 
     var req = try client.request(.GET, try std.Uri.parse(endpoint), .{ .extra_headers = headers.items });
     defer req.deinit();
-    try req.sendBodyComplete(&.{});
+    try req.sendBodiless();
 
     var redirect_buf: [4096]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);

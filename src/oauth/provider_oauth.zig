@@ -178,7 +178,7 @@ fn getAndParseJson(
 
     var req = try client.request(.GET, try std.Uri.parse(url), .{ .extra_headers = extra_headers });
     defer req.deinit();
-    try req.sendBodyComplete("");
+    try req.sendBodiless();
 
     var redirect_buf: [1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
