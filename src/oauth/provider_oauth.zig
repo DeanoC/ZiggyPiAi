@@ -72,6 +72,45 @@ pub fn piAuthPathFromHome(allocator: std.mem.Allocator, home: []const u8) ?[]con
     return std.fmt.allocPrint(allocator, "{s}/.pi/agent/auth.json", .{home}) catch null;
 }
 
+const AuthFileLock = struct {
+    file: std.fs.File,
+    path: []const u8,
+
+    fn release(self: *AuthFileLock, allocator: std.mem.Allocator) void {
+        self.file.close();
+        std.fs.deleteFileAbsolute(self.path) catch {};
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn acquireAuthFileLock(
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+) !AuthFileLock {
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{auth_path});
+    errdefer allocator.free(lock_path);
+
+    const max_attempts: u32 = 100;
+    var attempt: u32 = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const file = std.fs.createFileAbsolute(lock_path, .{
+            .exclusive = true,
+            .truncate = false,
+            .mode = 0o600,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+
+        return .{ .file = file, .path = lock_path };
+    }
+    return error.AuthFileLockTimeout;
+}
+
 fn readOAuthCredentialsFromFile(
     allocator: std.mem.Allocator,
     auth_path: []const u8,
@@ -393,6 +432,30 @@ fn writeOAuthCredentialsToFile(
     try file.writeAll("\n");
 }
 
+fn removeProviderEntryFromFile(
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+    provider: []const u8,
+) !void {
+    const file = std.fs.openFileAbsolute(auth_path, .{ .mode = .read_only }) catch return;
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(contents);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    _ = parsed.value.object.swapRemove(provider);
+
+    const out_file = try std.fs.createFileAbsolute(auth_path, .{ .truncate = true, .mode = 0o600 });
+    defer out_file.close();
+    const json_payload = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+    defer allocator.free(json_payload);
+    try out_file.writeAll(json_payload);
+    try out_file.writeAll("\n");
+}
+
 fn ensureAbsolutePath(path: []const u8) !void {
     if (path.len == 0 or path[0] != '/') return error.InvalidPath;
     var partial = std.array_list.Managed(u8).init(std.heap.page_allocator);
@@ -438,6 +501,29 @@ pub fn getPiApiKeyEntry(allocator: std.mem.Allocator, provider: []const u8) ?[]c
     return readApiKeyEntryFromFile(allocator, auth_path, provider);
 }
 
+pub fn savePiOAuthCredentials(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    creds: OAuthCredentials,
+) !void {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    const auth_path = piAuthPathFromHome(allocator, home) orelse return error.OutOfMemory;
+    defer allocator.free(auth_path);
+    try writeOAuthCredentialsToFile(allocator, auth_path, provider, creds);
+}
+
+pub fn removePiAuthProviderEntry(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+) !void {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    defer allocator.free(home);
+    const auth_path = piAuthPathFromHome(allocator, home) orelse return;
+    defer allocator.free(auth_path);
+    try removeProviderEntryFromFile(allocator, auth_path, provider);
+}
+
 pub fn getPiOAuthApiKeyFromPath(
     allocator: std.mem.Allocator,
     provider: []const u8,
@@ -448,7 +534,17 @@ pub fn getPiOAuthApiKeyFromPath(
 
     const now_ms: u64 = @intCast(std.time.milliTimestamp());
     if (now_ms >= creds.expires_at_ms) {
-        var refreshed = refreshOAuthToken(allocator, provider, creds) catch return null;
+        var lock = acquireAuthFileLock(allocator, auth_path) catch return null;
+        defer lock.release(allocator);
+
+        var latest = readOAuthCredentialsFromFile(allocator, auth_path, provider) orelse return null;
+        defer freeOAuthCredentials(allocator, &latest);
+        const latest_now_ms: u64 = @intCast(std.time.milliTimestamp());
+        if (latest_now_ms < latest.expires_at_ms) {
+            return providerApiKey(allocator, provider, latest);
+        }
+
+        var refreshed = refreshOAuthToken(allocator, provider, latest) catch return null;
         defer freeOAuthCredentials(allocator, &refreshed);
         writeOAuthCredentialsToFile(allocator, auth_path, provider, refreshed) catch {};
         return providerApiKey(allocator, provider, refreshed);
@@ -529,4 +625,31 @@ test "pi auth resolves api_key credential entry" {
     const key = readApiKeyEntryFromFile(allocator, full_path, "openrouter") orelse return error.TestExpectedEqual;
     defer allocator.free(key);
     try std.testing.expectEqualStrings("sk-openrouter-test", key);
+}
+
+test "pi auth can remove provider entry from file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".pi/agent");
+    const file = try tmp.dir.createFile(".pi/agent/auth.json", .{});
+    defer file.close();
+    try file.writeAll(
+        \\{"openrouter":{"type":"api_key","key":"sk-openrouter-test"},"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":4102444800000}}
+    );
+
+    const cwd_realpath = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_realpath);
+    const full_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/.pi/agent/auth.json",
+        .{ cwd_realpath, tmp.sub_path },
+    );
+    defer allocator.free(full_path);
+
+    try removeProviderEntryFromFile(allocator, full_path, "openrouter");
+    try std.testing.expect(readApiKeyEntryFromFile(allocator, full_path, "openrouter") == null);
+    const codex_key = getPiOAuthApiKeyFromPath(allocator, "openai-codex", full_path) orelse return error.TestExpectedEqual;
+    defer allocator.free(codex_key);
+    try std.testing.expectEqualStrings("a", codex_key);
 }
