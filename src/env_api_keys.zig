@@ -94,10 +94,14 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
         return null;
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
-        const has_project = (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
+        const project = std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
             std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT_ID") catch
-            std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null) != null;
-        const has_location = (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_LOCATION") catch null) != null;
+            std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null;
+        defer if (project) |v| allocator.free(v);
+        const location = std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_LOCATION") catch null;
+        defer if (location) |v| allocator.free(v);
+        const has_project = project != null;
+        const has_location = location != null;
         if (has_project and has_location and hasVertexAdcCredentials(allocator)) {
             return allocator.dupe(u8, "<authenticated>") catch null;
         }
