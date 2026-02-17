@@ -1,6 +1,6 @@
 # ZiggyPiAi
 
-Initial Zig port of `pi-mono/packages/ai`.
+Zig port/inspired version of typescript library `pi-mono/packages/ai`.
 
 ## Build & Test
 
