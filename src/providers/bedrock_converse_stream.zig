@@ -329,6 +329,53 @@ fn appendAssistantToolCalls(writer: anytype, msg: types.Message) !bool {
     return true;
 }
 
+fn supportsAdaptiveThinking(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "opus-4-6") != null or std.mem.indexOf(u8, model_id, "opus-4.6") != null;
+}
+
+fn mapThinkingEffort(reasoning: []const u8) []const u8 {
+    if (std.mem.eql(u8, reasoning, "minimal") or std.mem.eql(u8, reasoning, "low")) return "low";
+    if (std.mem.eql(u8, reasoning, "medium")) return "medium";
+    return "high";
+}
+
+fn thinkingBudget(reasoning: []const u8) u32 {
+    if (std.mem.eql(u8, reasoning, "minimal")) return 1024;
+    if (std.mem.eql(u8, reasoning, "low")) return 2048;
+    if (std.mem.eql(u8, reasoning, "medium")) return 8192;
+    if (std.mem.eql(u8, reasoning, "high")) return 16384;
+    if (std.mem.eql(u8, reasoning, "xhigh")) return 16384;
+    return 8192;
+}
+
+fn buildAdditionalModelRequestFields(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+) !?[]const u8 {
+    const reasoning = options.reasoning orelse return null;
+    if (!model.reasoning) return null;
+    const is_anthropic = std.mem.indexOf(u8, model.id, "anthropic.claude") != null or std.mem.indexOf(u8, model.id, "anthropic/claude") != null;
+    if (!is_anthropic) return null;
+
+    if (supportsAdaptiveThinking(model.id)) {
+        const effort = mapThinkingEffort(reasoning);
+        const out = try std.fmt.allocPrint(
+            allocator,
+            "{{\"thinking\":{{\"type\":\"adaptive\"}},\"output_config\":{{\"effort\":\"{s}\"}}}}",
+            .{effort},
+        );
+        return out;
+    }
+
+    const out = try std.fmt.allocPrint(
+        allocator,
+        "{{\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}},\"anthropic_beta\":[\"interleaved-thinking-2025-05-14\"]}}",
+        .{thinkingBudget(reasoning)},
+    );
+    return out;
+}
+
 fn buildConverseBody(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -401,6 +448,12 @@ fn buildConverseBody(
         try body.writer().writeAll("}");
     }
 
+    if (try buildAdditionalModelRequestFields(allocator, model, options)) |additional_fields| {
+        defer allocator.free(additional_fields);
+        try body.writer().writeAll(",\"additionalModelRequestFields\":");
+        try body.writer().writeAll(additional_fields);
+    }
+
     if (context.tools) |tools| {
         try body.writer().writeAll(",\"toolConfig\":{\"tools\":[");
         for (tools, 0..) |tool, i| {
@@ -416,7 +469,6 @@ fn buildConverseBody(
         try body.writer().writeAll("]}");
     }
 
-    _ = model;
     try body.writer().writeAll("}");
     return body.toOwnedSlice();
 }
@@ -730,6 +782,14 @@ test "bedrock stop reason mapping" {
     try std.testing.expect(mapStopReason("end_turn") == .stop);
     try std.testing.expect(mapStopReason("max_tokens") == .length);
     try std.testing.expect(mapStopReason("tool_use") == .tool_use);
+}
+
+test "bedrock thinking budget mapping" {
+    try std.testing.expectEqual(@as(u32, 1024), thinkingBudget("minimal"));
+    try std.testing.expectEqual(@as(u32, 2048), thinkingBudget("low"));
+    try std.testing.expectEqual(@as(u32, 8192), thinkingBudget("medium"));
+    try std.testing.expectEqual(@as(u32, 16384), thinkingBudget("high"));
+    try std.testing.expectEqual(@as(u32, 16384), thinkingBudget("xhigh"));
 }
 
 test "bedrock response parser emits text and tool events" {
