@@ -4,8 +4,13 @@ pub const env_api_keys = @import("env_api_keys.zig");
 pub const models = @import("models.zig");
 pub const stream = @import("stream.zig");
 pub const transform_messages = @import("transform_messages.zig");
+pub const oauth = struct {
+    pub const openai_codex = @import("oauth/openai_codex_oauth.zig");
+};
 pub const providers = struct {
     pub const anthropic_messages = @import("providers/anthropic_messages.zig");
+    pub const bedrock_converse_stream = @import("providers/bedrock_converse_stream.zig");
+    pub const google_generative_ai = @import("providers/google_generative_ai.zig");
     pub const openai_compat = @import("providers/openai_compat.zig");
     pub const openai_responses = @import("providers/openai_responses.zig");
     pub const openai_codex_responses = @import("providers/openai_codex_responses.zig");
@@ -19,8 +24,12 @@ test {
     _ = models;
     _ = stream;
     _ = transform_messages;
+    _ = oauth;
+    _ = oauth.openai_codex;
     _ = providers;
     _ = providers.anthropic_messages;
+    _ = providers.bedrock_converse_stream;
+    _ = providers.google_generative_ai;
     _ = providers.openai_compat;
     _ = providers.openai_responses;
     _ = providers.openai_codex_responses;

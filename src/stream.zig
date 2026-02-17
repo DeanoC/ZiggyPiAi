@@ -175,10 +175,29 @@ pub fn streamSimpleByModel(
     options: types.SimpleStreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
+    const provider = api_registry.get(model.api) orelse return error.ProviderNotRegistered;
+    var opts = options;
+    var env_key: ?[]const u8 = null;
+    defer if (env_key) |k| allocator.free(k);
+    if (opts.api_key == null) {
+        env_key = env_api_keys.getEnvApiKey(allocator, model.provider);
+        opts.api_key = env_key;
+    }
+
+    if (provider.stream_simple) |stream_simple| {
+        try stream_simple(allocator, client, model, context, opts, events);
+        return;
+    }
+
     try streamByModel(allocator, client, api_registry, model, context, .{
         .temperature = options.temperature,
         .max_tokens = options.max_tokens,
-        .api_key = options.api_key,
+        .api_key = opts.api_key,
+        .reasoning = options.reasoning,
+        .reasoning_summary = options.reasoning_summary,
+        .session_id = options.session_id,
+        .text_verbosity = options.text_verbosity,
+        .headers = options.headers,
     }, events);
 }
 
@@ -222,11 +241,13 @@ pub fn completeSimpleByModel(
     context: types.Context,
     options: types.SimpleStreamOptions,
 ) !types.AssistantMessage {
-    return try completeByModel(allocator, client, api_registry, model, context, .{
-        .temperature = options.temperature,
-        .max_tokens = options.max_tokens,
-        .api_key = options.api_key,
-    });
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |*event| freeEventPayloads(allocator, event);
+        events.deinit();
+    }
+    try streamSimpleByModel(allocator, client, api_registry, model, context, options, &events);
+    return try extractFinalMessage(allocator, model, events.items);
 }
 
 pub fn completeByProviderModelId(
@@ -254,11 +275,7 @@ pub fn completeSimpleByProviderModelId(
     options: types.SimpleStreamOptions,
 ) !types.AssistantMessage {
     const model = model_registry.getModel(provider, model_id) orelse return error.ModelNotFound;
-    return try completeByModel(allocator, client, api_registry, model, context, .{
-        .temperature = options.temperature,
-        .max_tokens = options.max_tokens,
-        .api_key = options.api_key,
-    });
+    return try completeSimpleByModel(allocator, client, api_registry, model, context, options);
 }
 
 fn fakeStream(
@@ -296,6 +313,29 @@ fn fakeErrStream(
     _ = context;
     _ = options;
     try events.append(.{ .err = try allocator.dupe(u8, "forced error") });
+}
+
+fn fakeSimpleStream(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    model: types.Model,
+    context: types.Context,
+    options: types.SimpleStreamOptions,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    _ = client;
+    _ = model;
+    _ = context;
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, options.reasoning orelse "simple"),
+        .thinking = "",
+        .tool_calls = &.{},
+        .api = "simple",
+        .provider = "simple",
+        .model = "simple",
+        .usage = .{},
+        .stop_reason = if (options.api_key != null) .stop else .err,
+    } });
 }
 
 test "streamByProviderModelId dispatches registered provider" {
@@ -364,6 +404,45 @@ test "streamSimpleByProviderModelId dispatches registered provider" {
 
     try streamSimpleByProviderModelId(allocator, &client, &api_registry, &model_registry, "openai", "m2", ctx, .{ .api_key = "x" }, &events);
     try std.testing.expect(events.items.len == 1);
+}
+
+test "streamSimpleByModel uses provider stream_simple when available" {
+    const allocator = std.testing.allocator;
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var api_registry = api_registry_mod.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try api_registry.register(.{
+        .api = "openai-completions",
+        .stream = fakeStream,
+        .stream_simple = fakeSimpleStream,
+    });
+
+    const model: types.Model = .{
+        .id = "m_simple",
+        .name = "m_simple",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const ctx: types.Context = .{ .messages = &.{} };
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |*event| freeEventPayloads(allocator, event);
+        events.deinit();
+    }
+
+    try streamSimpleByModel(allocator, &client, &api_registry, model, ctx, .{ .api_key = "x", .reasoning = "from-simple" }, &events);
+    try std.testing.expect(events.items.len == 1);
+    switch (events.items[0]) {
+        .done => |done| try std.testing.expectEqualStrings("from-simple", done.text),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "completeByModel returns final assistant message" {

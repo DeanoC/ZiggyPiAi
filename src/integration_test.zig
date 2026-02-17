@@ -42,7 +42,7 @@ fn readDotEnvKey(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
         if (!mem.eql(u8, name, key)) continue;
         var value = mem.trim(u8, trimmed[eq + 1 ..], " \t\r");
         if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
-            value = value[1..value.len - 1];
+            value = value[1 .. value.len - 1];
         }
         return allocator.dupe(u8, value) catch return null;
     }
@@ -105,7 +105,7 @@ fn integrationServerWorker(args: *IntegrationServerArgs) void {
     };
 
     if (request.head.method != .POST) {
-        std.debug.panic("expected POST request but got {s}\n", .{ @tagName(request.head.method) });
+        std.debug.panic("expected POST request but got {s}\n", .{@tagName(request.head.method)});
     }
 
     var headers = mem.splitSequence(u8, request.head_buffer, "\r\n");
@@ -246,7 +246,7 @@ test "openai responses integration" {
         .expected_model_id = "gpt-4o-mini",
     };
 
-    const server_thread = try Thread.spawn(.{}, integrationServerWorker, .{ &server_ctx });
+    const server_thread = try Thread.spawn(.{}, integrationServerWorker, .{&server_ctx});
     defer server_thread.join();
     while (!server_ready.load(.seq_cst)) {
         _ = Thread.yield() catch {};
@@ -268,7 +268,7 @@ test "openai responses integration" {
     };
 
     const user_message = types.Message{ .role = .user, .content = prompt };
-    var context_messages: [1]types.Message = .{ user_message };
+    var context_messages: [1]types.Message = .{user_message};
     const context = types.Context{ .messages = context_messages[0..] };
 
     var client = std.http.Client{ .allocator = allocator };
@@ -312,29 +312,27 @@ test "codex spark originator integration" {
         .expected_originator = "spark",
     };
 
-    const server_thread = try Thread.spawn(.{}, integrationServerWorker, .{ &server_ctx });
+    const server_thread = try Thread.spawn(.{}, integrationServerWorker, .{&server_ctx});
     defer server_thread.join();
     while (!server_ready.load(.seq_cst)) {
         _ = Thread.yield() catch {};
     }
 
-    const base_url = try fmt.allocPrint(allocator, "http://127.0.0.1:{d}/codex", .{port});
-    defer allocator.free(base_url);
-
     const model = types.Model{
         .id = "gpt-5.3-codex-spark",
         .name = "GPT-5.3 Codex Spark",
-        .api = "openai-responses",
-        .provider = "openai",
-        .base_url = base_url,
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = try fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port}),
         .reasoning = true,
         .cost = .{ .input = 0, .output = 0 },
         .context_window = 128_000,
         .max_tokens = 16_384,
     };
+    defer allocator.free(model.base_url);
 
     const user_message = types.Message{ .role = .user, .content = prompt };
-    var context_messages: [1]types.Message = .{ user_message };
+    var context_messages: [1]types.Message = .{user_message};
     const context = types.Context{ .messages = context_messages[0..] };
 
     var client = std.http.Client{ .allocator = allocator };
@@ -356,7 +354,7 @@ test "openai codex live smoke" {
     const allocator = std.testing.allocator;
     const prompt = "Answer with exactly one character: 4";
     const user_message = types.Message{ .role = .user, .content = prompt };
-    var context_messages: [1]types.Message = .{ user_message };
+    var context_messages: [1]types.Message = .{user_message};
     const context = types.Context{
         .system_prompt = "You are a concise assistant. Follow the user's instruction exactly.",
         .messages = context_messages[0..],
@@ -391,7 +389,7 @@ test "kimi code live smoke" {
     const allocator = std.testing.allocator;
     const prompt = "Answer with exactly one character: 4";
     const user_message = types.Message{ .role = .user, .content = prompt };
-    var context_messages: [1]types.Message = .{ user_message };
+    var context_messages: [1]types.Message = .{user_message};
     const context = types.Context{
         .system_prompt = "You are a concise assistant. Follow the user's instruction exactly.",
         .messages = context_messages[0..],

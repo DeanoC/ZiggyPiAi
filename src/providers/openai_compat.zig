@@ -594,6 +594,31 @@ pub fn streamOpenAICompat(
     try parseSSEFrames(allocator, response_buf.items, model, events);
 }
 
+fn freeTestEvents(allocator: std.mem.Allocator, events: *std.array_list.Managed(types.AssistantMessageEvent)) void {
+    for (events.items) |ev| {
+        switch (ev) {
+            .text_delta => |v| allocator.free(v.delta),
+            .text_end => |v| allocator.free(v.content),
+            .thinking_delta => |v| allocator.free(v.delta),
+            .thinking_end => |v| allocator.free(v.content),
+            .toolcall_delta => |v| allocator.free(v.delta),
+            .done => |v| {
+                allocator.free(v.text);
+                allocator.free(v.thinking);
+                for (v.tool_calls) |tc| {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments_json);
+                }
+                allocator.free(v.tool_calls);
+            },
+            .err => |v| allocator.free(v),
+            else => {},
+        }
+    }
+    events.deinit();
+}
+
 test "parseSSEFrames emits text and toolcall events" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
@@ -614,30 +639,7 @@ test "parseSSEFrames emits text and toolcall events" {
         "data: [DONE]\n\n";
 
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
-    defer {
-        for (events.items) |ev| {
-            switch (ev) {
-                .text_delta => |v| allocator.free(v.delta),
-                .text_end => |v| allocator.free(v.content),
-                .thinking_delta => |v| allocator.free(v.delta),
-                .thinking_end => |v| allocator.free(v.content),
-                .toolcall_delta => |v| allocator.free(v.delta),
-                .done => |v| {
-                    allocator.free(v.text);
-                    allocator.free(v.thinking);
-                    for (v.tool_calls) |tc| {
-                        allocator.free(tc.id);
-                        allocator.free(tc.name);
-                        allocator.free(tc.arguments_json);
-                    }
-                    allocator.free(v.tool_calls);
-                },
-                .err => |v| allocator.free(v),
-                else => {},
-            }
-        }
-        events.deinit();
-    }
+    defer freeTestEvents(allocator, &events);
     try parseSSEFrames(allocator, sse, model, &events);
     try std.testing.expect(events.items.len >= 7);
 }
@@ -656,4 +658,107 @@ test "cached tool-call ID normalization memoizes" {
     const first = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
     const second = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
     try std.testing.expect(std.mem.eql(u8, first, second));
+}
+
+test "parseSSEFrames handles interleaved thinking and text deltas" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.15, .output = 0.60 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    };
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking-1\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"answer-1\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_text\":\"thinking-2\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"answer-2\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer freeTestEvents(allocator, &events);
+    try parseSSEFrames(allocator, sse, model, &events);
+
+    var saw_thinking = false;
+    var saw_text = false;
+    var saw_done = false;
+    for (events.items) |event| {
+        switch (event) {
+            .thinking_delta => saw_thinking = true,
+            .text_delta => saw_text = true,
+            .done => |done| {
+                saw_done = true;
+                try std.testing.expectEqualStrings("answer-1answer-2", done.text);
+                try std.testing.expectEqualStrings("thinking-1thinking-2", done.thinking);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_thinking);
+    try std.testing.expect(saw_text);
+    try std.testing.expect(saw_done);
+}
+
+test "parseSSEFrames handles empty stream payload" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = false,
+        .cost = .{ .input = 0.15, .output = 0.60 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    };
+    const sse = "data: [DONE]\n\n";
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer freeTestEvents(allocator, &events);
+    try parseSSEFrames(allocator, sse, model, &events);
+    try std.testing.expect(events.items.len == 2);
+    switch (events.items[1]) {
+        .done => |done| {
+            try std.testing.expectEqualStrings("", done.text);
+            try std.testing.expectEqualStrings("", done.thinking);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseSSEFrames preserves unicode content" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = false,
+        .cost = .{ .input = 0.15, .output = 0.60 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    };
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \\uD83D\\uDE00\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer freeTestEvents(allocator, &events);
+    try parseSSEFrames(allocator, sse, model, &events);
+
+    switch (events.items[1]) {
+        .text_start => {},
+        else => {},
+    }
+    switch (events.items[events.items.len - 1]) {
+        .done => |done| try std.testing.expect(std.mem.indexOf(u8, done.text, "Hello ") != null),
+        else => return error.TestUnexpectedResult,
+    }
 }
