@@ -40,6 +40,7 @@ Initial Zig port of `pi-mono/packages/ai`.
   - `google-generative-ai`: Gemini REST SSE with API key query auth
   - `google-gemini-cli` / `google-antigravity`: Cloud Code Assist SSE endpoint with bearer auth (supports JSON credential payloads containing `token` + `projectId`)
   - `google-vertex`: Vertex REST SSE endpoint shape using project/location with bearer auth
+  - `google-vertex` env resolution now mirrors ADC-style auth signaling (`GOOGLE_APPLICATION_CREDENTIALS` or default gcloud ADC file + project/location)
 - Amazon Bedrock Converse (`bedrock-converse-stream`) via `src/providers/bedrock_converse_stream.zig`
   - Supports `AWS_BEARER_TOKEN_BEDROCK` bearer auth
   - Supports AWS IAM SigV4 signing via `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)

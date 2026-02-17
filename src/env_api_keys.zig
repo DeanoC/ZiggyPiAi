@@ -1,6 +1,27 @@
 const std = @import("std");
 const codex_oauth = @import("oauth/openai_codex_oauth.zig");
 
+fn fileExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn hasVertexAdcCredentials(allocator: std.mem.Allocator) bool {
+    const gac_path = std.process.getEnvVarOwned(allocator, "GOOGLE_APPLICATION_CREDENTIALS") catch null;
+    defer if (gac_path) |p| allocator.free(p);
+    if (gac_path) |p| return fileExistsAbsolute(p);
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return false;
+    defer allocator.free(home);
+    const default_adc = std.fmt.allocPrint(
+        allocator,
+        "{s}/.config/gcloud/application_default_credentials.json",
+        .{home},
+    ) catch return false;
+    defer allocator.free(default_adc);
+    return fileExistsAbsolute(default_adc);
+}
+
 pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "openai"))
         return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
@@ -64,15 +85,21 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
     if (std.mem.eql(u8, provider, "opencode")) {
         return std.process.getEnvVarOwned(allocator, "OPENCODE_API_KEY") catch null;
     }
-    if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-generative-ai") or std.mem.eql(u8, provider, "google-gemini-cli")) {
+    if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-generative-ai")) {
         return std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
     }
-    if (std.mem.eql(u8, provider, "google-antigravity")) {
-        return std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
-            std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
+    if (std.mem.eql(u8, provider, "google-gemini-cli") or std.mem.eql(u8, provider, "google-antigravity")) {
+        // Cloud Code Assist providers use OAuth bearer credentials, not static API keys.
+        return null;
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
+        const has_project = (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
+            std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null) != null;
+        const has_location = (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_LOCATION") catch null) != null;
+        if (has_project and has_location and hasVertexAdcCredentials(allocator)) {
+            return allocator.dupe(u8, "<authenticated>") catch null;
+        }
         return std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "GEMINI_API_KEY") catch
             std.process.getEnvVarOwned(allocator, "GOOGLE_API_KEY") catch null;
@@ -80,6 +107,18 @@ pub fn getEnvApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const
     if (std.mem.eql(u8, provider, "bedrock") or std.mem.eql(u8, provider, "amazon-bedrock") or std.mem.eql(u8, provider, "bedrock-converse-stream")) {
         if (std.process.getEnvVarOwned(allocator, "AWS_PROFILE")) |profile| {
             defer allocator.free(profile);
+            return allocator.dupe(u8, "<authenticated>") catch null;
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")) |v| {
+            defer allocator.free(v);
+            return allocator.dupe(u8, "<authenticated>") catch null;
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "AWS_CONTAINER_CREDENTIALS_FULL_URI")) |v| {
+            defer allocator.free(v);
+            return allocator.dupe(u8, "<authenticated>") catch null;
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "AWS_WEB_IDENTITY_TOKEN_FILE")) |v| {
+            defer allocator.free(v);
             return allocator.dupe(u8, "<authenticated>") catch null;
         } else |_| {}
         return std.process.getEnvVarOwned(allocator, "AWS_BEARER_TOKEN_BEDROCK") catch {
