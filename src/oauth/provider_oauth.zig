@@ -383,16 +383,31 @@ fn writeOAuthCredentialsToFile(
     try root_value.object.put(provider, .{ .object = entry });
 
     const parent = std.fs.path.dirname(auth_path);
-    if (parent) |p| std.fs.makeDirAbsolute(p) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
+    if (parent) |p| try ensureAbsolutePath(p);
 
-    const file = try std.fs.createFileAbsolute(auth_path, .{ .truncate = true });
+    const file = try std.fs.createFileAbsolute(auth_path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
     const json_payload = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(root_value, .{})});
     defer allocator.free(json_payload);
     try file.writeAll(json_payload);
     try file.writeAll("\n");
+}
+
+fn ensureAbsolutePath(path: []const u8) !void {
+    if (path.len == 0 or path[0] != '/') return error.InvalidPath;
+    var partial = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer partial.deinit();
+    try partial.append('/');
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (partial.items.len > 1) try partial.append('/');
+        try partial.appendSlice(segment);
+        std.fs.makeDirAbsolute(partial.items) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
 }
 
 fn providerApiKey(allocator: std.mem.Allocator, provider: []const u8, creds: OAuthCredentials) ?[]const u8 {
