@@ -6,6 +6,20 @@ fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
 }
 
+fn deriveGitHubCopilotBaseUrlFromToken(allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
+    const marker = "proxy-ep=";
+    const start = std.mem.indexOf(u8, token, marker) orelse return null;
+    const host_start = start + marker.len;
+    const host_end = std.mem.indexOfScalarPos(u8, token, host_start, ';') orelse token.len;
+    if (host_end <= host_start) return null;
+    const proxy_host = token[host_start..host_end];
+
+    if (std.mem.startsWith(u8, proxy_host, "proxy.")) {
+        return std.fmt.allocPrint(allocator, "https://api.{s}", .{proxy_host["proxy.".len..]}) catch null;
+    }
+    return std.fmt.allocPrint(allocator, "https://{s}", .{proxy_host}) catch null;
+}
+
 fn readAllResponseBody(reader: *std.Io.Reader, out: *std.array_list.Managed(u8)) !void {
     var tmp: [4096]u8 = undefined;
     while (true) {
@@ -555,7 +569,15 @@ pub fn streamOpenAICompat(
     }
     try body.writer().writeAll("}");
 
-    const endpoint = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url});
+    var base_url: []const u8 = model.base_url;
+    var derived_base_url: ?[]const u8 = null;
+    defer if (derived_base_url) |v| allocator.free(v);
+    if (std.mem.eql(u8, model.provider, "github-copilot")) {
+        derived_base_url = deriveGitHubCopilotBaseUrlFromToken(allocator, api_key);
+        if (derived_base_url) |v| base_url = v;
+    }
+
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
     defer allocator.free(endpoint);
 
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
@@ -658,6 +680,19 @@ test "cached tool-call ID normalization memoizes" {
     const first = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
     const second = try cachedNormalizedToolCallId(allocator, "weird|id with spaces!", &map);
     try std.testing.expect(std.mem.eql(u8, first, second));
+}
+
+test "derive github copilot base url from proxy token" {
+    const allocator = std.testing.allocator;
+    const token = "tid=abc;exp=123;proxy-ep=proxy.individual.githubcopilot.com;foo=bar";
+    const base = deriveGitHubCopilotBaseUrlFromToken(allocator, token) orelse return error.TestExpectedEqual;
+    defer allocator.free(base);
+    try std.testing.expectEqualStrings("https://api.individual.githubcopilot.com", base);
+}
+
+test "derive github copilot base url returns null without proxy marker" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(deriveGitHubCopilotBaseUrlFromToken(allocator, "plain-token-value") == null);
 }
 
 test "parseSSEFrames handles interleaved thinking and text deltas" {
