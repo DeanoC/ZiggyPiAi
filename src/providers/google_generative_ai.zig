@@ -27,6 +27,10 @@ fn mapGoogleStopReason(reason: []const u8) types.StopReason {
     return .stop;
 }
 
+fn isAuthenticatedPlaceholder(value: []const u8) bool {
+    return std.mem.eql(u8, value, "<authenticated>");
+}
+
 fn appendMessageText(allocator: std.mem.Allocator, msg: types.Message, writer: anytype) !bool {
     var text = std.array_list.Managed(u8).init(allocator);
     defer text.deinit();
@@ -235,6 +239,7 @@ pub fn streamGoogleGenerativeAI(
         defer allocator.free(auth);
         try appendHeader(&headers, "authorization", auth);
         try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+        try appendHeader(&headers, "client-metadata", "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}");
         if (std.mem.eql(u8, model.provider, "google-antigravity")) {
             try appendHeader(&headers, "user-agent", "antigravity/1.15.8 darwin/arm64");
             if (containsCaseInsensitive(model.id, "claude") and containsCaseInsensitive(model.id, "thinking")) {
@@ -260,6 +265,10 @@ pub fn streamGoogleGenerativeAI(
         try writeJson(body.writer(), model.id);
         try body.writer().writeAll(",\"request\":{");
         try writeGenerateRequestBody(allocator, body.writer(), context, options, false, true);
+        if (options.session_id) |session_id| {
+            try body.writer().writeAll(",\"sessionId\":");
+            try writeJson(body.writer(), session_id);
+        }
         if (std.mem.eql(u8, model.provider, "google-antigravity")) {
             try body.writer().writeAll(",\"systemInstruction\":{\"role\":\"user\",\"parts\":[{\"text\":");
             try writeJson(body.writer(), antigravity_instruction);
@@ -274,6 +283,10 @@ pub fn streamGoogleGenerativeAI(
         try writeJson(body.writer(), request_id);
         try body.writer().writeByte('}');
     } else if (std.mem.eql(u8, model.api, "google-vertex")) {
+        if (isAuthenticatedPlaceholder(api_key)) {
+            try events.append(.{ .err = try allocator.dupe(u8, "GOOGLE_VERTEX_API_KEY or OAuth token is required for Vertex in ZiggyPiAi; ADC placeholder credentials are detected but not yet exchangeable here.") });
+            return;
+        }
         var creds = try parseGoogleCredentials(allocator, api_key);
         defer deinitGoogleCredentials(allocator, &creds);
         const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
