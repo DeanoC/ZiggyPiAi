@@ -36,6 +36,10 @@ Initial Zig port of `pi-mono/packages/ai`.
 - Kimi routing through Anthropic-compatible provider aliases (`kimi-code`, `kimi-coding`)
 - Google Generative AI (`google-generative-ai`) via `src/providers/google_generative_ai.zig`
 - Google provider aliases `google-gemini-cli` and `google-vertex` (wired to the same adapter path)
+- Provider-aware Google transport behavior:
+  - `google-generative-ai`: Gemini REST SSE with API key query auth
+  - `google-gemini-cli` / `google-antigravity`: Cloud Code Assist SSE endpoint with bearer auth (supports JSON credential payloads containing `token` + `projectId`)
+  - `google-vertex`: Vertex REST SSE endpoint shape using project/location with bearer auth
 - Amazon Bedrock Converse (`bedrock-converse-stream`) via `src/providers/bedrock_converse_stream.zig`
   - Supports `AWS_BEARER_TOKEN_BEDROCK` bearer auth
   - Supports AWS IAM SigV4 signing via `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)

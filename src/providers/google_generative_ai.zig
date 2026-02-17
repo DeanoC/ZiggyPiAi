@@ -40,6 +40,128 @@ fn generateToolId(allocator: std.mem.Allocator, name: []const u8, index: usize) 
     return std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, index });
 }
 
+const GoogleCredentials = struct {
+    token: []const u8,
+    project_id: ?[]const u8 = null,
+};
+
+fn parseGoogleCredentials(
+    allocator: std.mem.Allocator,
+    api_key_or_token: []const u8,
+) !GoogleCredentials {
+    if (api_key_or_token.len == 0) return error.MissingApiKey;
+    const trimmed = std.mem.trim(u8, api_key_or_token, " \t\r\n");
+    if (trimmed.len == 0) return error.MissingApiKey;
+    if (trimmed[0] != '{') {
+        return .{
+            .token = try allocator.dupe(u8, trimmed),
+            .project_id = null,
+        };
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+        return .{
+            .token = try allocator.dupe(u8, trimmed),
+            .project_id = null,
+        };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGoogleCredentials;
+
+    const token_v = parsed.value.object.get("token") orelse return error.InvalidGoogleCredentials;
+    if (token_v != .string or token_v.string.len == 0) return error.InvalidGoogleCredentials;
+
+    const project_id = if (parsed.value.object.get("projectId")) |project_v|
+        if (project_v == .string and project_v.string.len > 0) try allocator.dupe(u8, project_v.string) else null
+    else
+        null;
+
+    return .{
+        .token = try allocator.dupe(u8, token_v.string),
+        .project_id = project_id,
+    };
+}
+
+fn deinitGoogleCredentials(allocator: std.mem.Allocator, creds: *GoogleCredentials) void {
+    allocator.free(creds.token);
+    if (creds.project_id) |project| allocator.free(project);
+}
+
+fn resolveVertexLocation(allocator: std.mem.Allocator) ![]const u8 {
+    return std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_LOCATION") catch
+        std.process.getEnvVarOwned(allocator, "CLOUD_ML_REGION") catch
+        allocator.dupe(u8, "us-central1");
+}
+
+fn resolveProjectId(allocator: std.mem.Allocator, creds: GoogleCredentials) !?[]const u8 {
+    if (creds.project_id) |project| {
+        const copied = try allocator.dupe(u8, project);
+        return copied;
+    }
+    return std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
+        std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null;
+}
+
+fn writeGenerateRequestBody(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    context: types.Context,
+    options: types.StreamOptions,
+) !void {
+    try writer.writeAll("{\"contents\":[");
+    var first = true;
+    if (context.system_prompt) |sys| {
+        try writer.writeAll("{\"role\":\"user\",\"parts\":[{\"text\":");
+        try writeJson(writer, sys);
+        try writer.writeAll("}]}");
+        first = false;
+    }
+
+    for (context.messages) |msg| {
+        if (msg.role != .user and msg.role != .assistant) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.writeAll("{\"role\":");
+        try writeJson(writer, if (msg.role == .assistant) "model" else "user");
+        try writer.writeAll(",\"parts\":[{\"text\":");
+        const has_text = try appendMessageText(allocator, msg, writer);
+        if (!has_text) try writeJson(writer, "");
+        try writer.writeAll("}]}");
+    }
+    try writer.writeAll("]");
+
+    if (context.tools) |tools| {
+        try writer.writeAll(",\"tools\":[{\"functionDeclarations\":[");
+        for (tools, 0..) |tool, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"name\":");
+            try writeJson(writer, tool.name);
+            try writer.writeAll(",\"description\":");
+            try writeJson(writer, tool.description);
+            try writer.writeAll(",\"parameters\":");
+            try writer.writeAll(tool.parameters_json);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]}]");
+    }
+
+    if (options.temperature != null or options.max_tokens != null) {
+        try writer.writeAll(",\"generationConfig\":{");
+        var wrote = false;
+        if (options.temperature) |temp| {
+            try writer.writeAll("\"temperature\":");
+            try writer.print("{d}", .{temp});
+            wrote = true;
+        }
+        if (options.max_tokens) |max_tokens| {
+            if (wrote) try writer.writeByte(',');
+            try writer.writeAll("\"maxOutputTokens\":");
+            try writer.print("{d}", .{max_tokens});
+        }
+        try writer.writeAll("}");
+    }
+}
+
 pub fn streamGoogleGenerativeAI(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -49,83 +171,102 @@ pub fn streamGoogleGenerativeAI(
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     const api_key = options.api_key orelse return error.MissingApiKey;
-    const base = std.mem.trimRight(u8, model.base_url, "/");
-    const endpoint = try std.fmt.allocPrint(
-        allocator,
-        "{s}/models/{s}:streamGenerateContent?alt=sse&key={s}",
-        .{ base, model.id, api_key },
-    );
-    defer allocator.free(endpoint);
 
+    var endpoint = std.array_list.Managed(u8).init(allocator);
+    defer endpoint.deinit();
     var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
-
-    try body.writer().writeAll("{\"contents\":[");
-    var first = true;
-    if (context.system_prompt) |sys| {
-        try body.writer().writeAll("{\"role\":\"user\",\"parts\":[{\"text\":");
-        try writeJson(body.writer(), sys);
-        try body.writer().writeAll("}]}");
-        first = false;
-    }
-
-    for (context.messages) |msg| {
-        if (msg.role != .user and msg.role != .assistant) continue;
-        var has_text = false;
-        if (!first) try body.writer().writeByte(',');
-        first = false;
-        try body.writer().writeAll("{\"role\":");
-        try writeJson(body.writer(), if (msg.role == .assistant) "model" else "user");
-        try body.writer().writeAll(",\"parts\":[{\"text\":");
-        has_text = try appendMessageText(allocator, msg, body.writer());
-        if (!has_text) {
-            try writeJson(body.writer(), "");
-        }
-        try body.writer().writeAll("}]}");
-    }
-    try body.writer().writeAll("]");
-
-    if (context.tools) |tools| {
-        try body.writer().writeAll(",\"tools\":[{\"functionDeclarations\":[");
-        for (tools, 0..) |tool, i| {
-            if (i > 0) try body.writer().writeByte(',');
-            try body.writer().writeAll("{\"name\":");
-            try writeJson(body.writer(), tool.name);
-            try body.writer().writeAll(",\"description\":");
-            try writeJson(body.writer(), tool.description);
-            try body.writer().writeAll(",\"parameters\":");
-            try body.writer().writeAll(tool.parameters_json);
-            try body.writer().writeAll("}");
-        }
-        try body.writer().writeAll("]}]");
-    }
-
-    if (options.temperature != null or options.max_tokens != null) {
-        try body.writer().writeAll(",\"generationConfig\":{");
-        var wrote = false;
-        if (options.temperature) |temp| {
-            try body.writer().writeAll("\"temperature\":");
-            try body.writer().print("{d}", .{temp});
-            wrote = true;
-        }
-        if (options.max_tokens) |max_tokens| {
-            if (wrote) try body.writer().writeByte(',');
-            try body.writer().writeAll("\"maxOutputTokens\":");
-            try body.writer().print("{d}", .{max_tokens});
-        }
-        try body.writer().writeAll("}");
-    }
-    try body.writer().writeAll("}");
 
     var headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer headers.deinit();
     try appendHeader(&headers, "content-type", "application/json");
     try appendHeader(&headers, "accept", "text/event-stream");
+
+    const base = std.mem.trimRight(u8, model.base_url, "/");
+    if (std.mem.eql(u8, model.api, "google-generative-ai")) {
+        const endpoint_owned = try std.fmt.allocPrint(
+            allocator,
+            "{s}/models/{s}:streamGenerateContent?alt=sse&key={s}",
+            .{ base, model.id, api_key },
+        );
+        defer allocator.free(endpoint_owned);
+        try endpoint.appendSlice(endpoint_owned);
+        try body.writer().writeByte('{');
+        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try body.writer().writeByte('}');
+    } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
+        var creds = try parseGoogleCredentials(allocator, api_key);
+        defer deinitGoogleCredentials(allocator, &creds);
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
+        defer allocator.free(auth);
+        try appendHeader(&headers, "authorization", auth);
+        try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
+            try appendHeader(&headers, "user-agent", "antigravity/1.15.8 darwin/arm64");
+        } else {
+            try appendHeader(&headers, "user-agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+        }
+
+        const endpoint_owned = try std.fmt.allocPrint(allocator, "{s}/v1internal:streamGenerateContent?alt=sse", .{base});
+        defer allocator.free(endpoint_owned);
+        try endpoint.appendSlice(endpoint_owned);
+
+        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
+        defer allocator.free(project_id);
+
+        const request_id = try std.fmt.allocPrint(allocator, "zig-{d}", .{@as(u64, @intCast(std.time.timestamp()))});
+        defer allocator.free(request_id);
+
+        try body.writer().writeAll("{\"project\":");
+        try writeJson(body.writer(), project_id);
+        try body.writer().writeAll(",\"model\":");
+        try writeJson(body.writer(), model.id);
+        try body.writer().writeAll(",\"request\":{");
+        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try body.writer().writeByte('}');
+        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
+            try body.writer().writeAll(",\"requestType\":\"agent\"");
+        }
+        try body.writer().writeAll(",\"userAgent\":\"ziggypiai\"");
+        try body.writer().writeAll(",\"requestId\":");
+        try writeJson(body.writer(), request_id);
+        try body.writer().writeByte('}');
+    } else if (std.mem.eql(u8, model.api, "google-vertex")) {
+        var creds = try parseGoogleCredentials(allocator, api_key);
+        defer deinitGoogleCredentials(allocator, &creds);
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
+        defer allocator.free(auth);
+        try appendHeader(&headers, "authorization", auth);
+
+        const location = try resolveVertexLocation(allocator);
+        defer allocator.free(location);
+        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
+        defer allocator.free(project_id);
+        const host = if (std.mem.indexOf(u8, model.base_url, "{location}") != null)
+            try std.mem.replaceOwned(u8, allocator, model.base_url, "{location}", location)
+        else
+            try allocator.dupe(u8, model.base_url);
+        defer allocator.free(host);
+        const host_trimmed = std.mem.trimRight(u8, host, "/");
+        const endpoint_owned = try std.fmt.allocPrint(
+            allocator,
+            "{s}/v1/projects/{s}/locations/{s}/publishers/google/models/{s}:streamGenerateContent?alt=sse",
+            .{ host_trimmed, project_id, location, model.id },
+        );
+        defer allocator.free(endpoint_owned);
+        try endpoint.appendSlice(endpoint_owned);
+        try body.writer().writeByte('{');
+        try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        try body.writer().writeByte('}');
+    } else {
+        return error.ProviderNotSupported;
+    }
+
     if (options.headers) |custom_headers| {
         for (custom_headers) |h| try appendHeader(&headers, h.name, h.value);
     }
 
-    var req = try client.request(.POST, try std.Uri.parse(endpoint), .{
+    var req = try client.request(.POST, try std.Uri.parse(endpoint.items), .{
         .extra_headers = headers.items,
     });
     defer req.deinit();
@@ -313,4 +454,21 @@ test "google stop reason mapping" {
     try std.testing.expect(mapGoogleStopReason("STOP") == .stop);
     try std.testing.expect(mapGoogleStopReason("MAX_TOKENS") == .length);
     try std.testing.expect(mapGoogleStopReason("TOOL_CALL") == .tool_use);
+}
+
+test "parse google credentials supports raw token" {
+    const allocator = std.testing.allocator;
+    var creds = try parseGoogleCredentials(allocator, "ya29.test");
+    defer deinitGoogleCredentials(allocator, &creds);
+    try std.testing.expectEqualStrings("ya29.test", creds.token);
+    try std.testing.expect(creds.project_id == null);
+}
+
+test "parse google credentials supports json token payload" {
+    const allocator = std.testing.allocator;
+    var creds = try parseGoogleCredentials(allocator, "{\"token\":\"ya29.test\",\"projectId\":\"my-project\"}");
+    defer deinitGoogleCredentials(allocator, &creds);
+    try std.testing.expectEqualStrings("ya29.test", creds.token);
+    try std.testing.expect(creds.project_id != null);
+    try std.testing.expectEqualStrings("my-project", creds.project_id.?);
 }
