@@ -40,6 +40,9 @@ fn generateToolId(allocator: std.mem.Allocator, name: []const u8, index: usize) 
     return std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, index });
 }
 
+const antigravity_instruction =
+    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
+
 const GoogleCredentials = struct {
     token: []const u8,
     project_id: ?[]const u8 = null,
@@ -100,6 +103,15 @@ fn resolveProjectId(allocator: std.mem.Allocator, creds: GoogleCredentials) !?[]
     }
     return std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch
         std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null;
+}
+
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn writeGenerateRequestBody(
@@ -203,6 +215,9 @@ pub fn streamGoogleGenerativeAI(
         try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
         if (std.mem.eql(u8, model.provider, "google-antigravity")) {
             try appendHeader(&headers, "user-agent", "antigravity/1.15.8 darwin/arm64");
+            if (containsCaseInsensitive(model.id, "claude") and containsCaseInsensitive(model.id, "thinking")) {
+                try appendHeader(&headers, "anthropic-beta", "interleaved-thinking-2025-05-14");
+            }
         } else {
             try appendHeader(&headers, "user-agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
         }
@@ -223,6 +238,11 @@ pub fn streamGoogleGenerativeAI(
         try writeJson(body.writer(), model.id);
         try body.writer().writeAll(",\"request\":{");
         try writeGenerateRequestBody(allocator, body.writer(), context, options);
+        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
+            try body.writer().writeAll(",\"systemInstruction\":{\"role\":\"user\",\"parts\":[{\"text\":");
+            try writeJson(body.writer(), antigravity_instruction);
+            try body.writer().writeAll("}]}");
+        }
         try body.writer().writeByte('}');
         if (std.mem.eql(u8, model.provider, "google-antigravity")) {
             try body.writer().writeAll(",\"requestType\":\"agent\"");
@@ -471,4 +491,10 @@ test "parse google credentials supports json token payload" {
     try std.testing.expectEqualStrings("ya29.test", creds.token);
     try std.testing.expect(creds.project_id != null);
     try std.testing.expectEqualStrings("my-project", creds.project_id.?);
+}
+
+test "containsCaseInsensitive matches mixed case substrings" {
+    try std.testing.expect(containsCaseInsensitive("Claude-Opus-4-5-Thinking", "claude"));
+    try std.testing.expect(containsCaseInsensitive("Claude-Opus-4-5-Thinking", "thinking"));
+    try std.testing.expect(!containsCaseInsensitive("gemini-2.5-pro", "claude"));
 }
