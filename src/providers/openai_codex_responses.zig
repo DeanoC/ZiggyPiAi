@@ -213,8 +213,32 @@ fn collectMessageText(allocator: std.mem.Allocator, msg: types.Message) ![]const
     return text.toOwnedSlice();
 }
 
+fn hasCompatDomain(base_url: []const u8, domain: []const u8) bool {
+    return std.mem.indexOf(u8, base_url, domain) != null;
+}
+
+fn supportsDeveloperRole(model: types.Model) bool {
+    const provider = model.provider;
+    const base_url = model.base_url;
+
+    const is_zai = std.mem.eql(u8, provider, "zai") or hasCompatDomain(base_url, "api.z.ai");
+    const is_non_standard = std.mem.eql(u8, provider, "cerebras") or
+        hasCompatDomain(base_url, "cerebras.ai") or
+        std.mem.eql(u8, provider, "xai") or
+        hasCompatDomain(base_url, "api.x.ai") or
+        std.mem.eql(u8, provider, "mistral") or
+        hasCompatDomain(base_url, "mistral.ai") or
+        hasCompatDomain(base_url, "chutes.ai") or
+        hasCompatDomain(base_url, "deepseek.com") or
+        is_zai or
+        std.mem.eql(u8, provider, "opencode") or
+        hasCompatDomain(base_url, "opencode.ai");
+    return !is_non_standard;
+}
+
 fn responseSystemRole(model: types.Model) []const u8 {
-    return if (model.reasoning) "developer" else "system";
+    if (model.reasoning and supportsDeveloperRole(model)) return "developer";
+    return "system";
 }
 
 fn normalizeToolCallChunk(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
@@ -955,6 +979,40 @@ test "openai responses request uses developer role system message and omits inst
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"sys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\"") == null);
+}
+
+test "openai responses request uses system role for non-standard reasoning providers" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "qwen-coder",
+        .name = "Qwen Coder",
+        .api = "openai-responses",
+        .provider = "opencode",
+        .base_url = "https://api.opencode.ai/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const messages: []const types.Message = &.{
+        .{ .role = .user, .content = "hello" },
+    };
+    const context: types.Context = .{
+        .system_prompt = "sys",
+        .messages = messages,
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{},
+        "https://api.opencode.ai/v1/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") == null);
 }
 
 test "codex responses request uses instructions and omits developer role" {
