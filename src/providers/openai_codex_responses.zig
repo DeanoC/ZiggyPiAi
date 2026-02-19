@@ -213,6 +213,10 @@ fn collectMessageText(allocator: std.mem.Allocator, msg: types.Message) ![]const
     return text.toOwnedSlice();
 }
 
+fn responseSystemRole(model: types.Model) []const u8 {
+    return if (model.reasoning) "developer" else "system";
+}
+
 fn normalizeToolCallChunk(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
     var normalized = std.array_list.Managed(u8).init(allocator);
     defer normalized.deinit();
@@ -388,29 +392,23 @@ fn finishCurrent(
     current_kind.* = .none;
 }
 
-fn streamOpenAIResponsesBase(
+fn buildResponsesRequestBody(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
     model: types.Model,
     context: types.Context,
     options: types.StreamOptions,
     endpoint: []const u8,
-    events: *std.array_list.Managed(types.AssistantMessageEvent),
-) !void {
-    const api_key = options.api_key orelse return error.MissingApiKey;
-    const is_codox_endpoint = std.mem.endsWith(u8, endpoint, "/codex/responses");
-    const account_id = if (is_codox_endpoint) extractCodexAccountId(allocator, api_key) catch null else null;
-    defer if (account_id) |aid| allocator.free(aid);
+) ![]u8 {
+    const is_codex_endpoint = std.mem.endsWith(u8, endpoint, "/codex/responses");
 
     var body = std.array_list.Managed(u8).init(allocator);
-    defer body.deinit();
+    errdefer body.deinit();
     try body.writer().writeAll("{\"model\":");
     try writeJson(body.writer(), model.id);
     try body.writer().writeAll(",\"stream\":true,\"store\":false");
     const prepared_messages = try transform.prepareMessagesForApi(allocator, context.messages);
     defer prepared_messages.deinit();
 
-    var first = true;
     var system_prompt = context.system_prompt;
     var system_prompt_owned: ?[]const u8 = null;
     defer if (system_prompt_owned) |owned| allocator.free(owned);
@@ -429,9 +427,11 @@ fn streamOpenAIResponsesBase(
         }
     }
 
-    if (system_prompt) |sp| {
-        try body.writer().writeAll(",\"instructions\":");
-        try writeJson(body.writer(), sp);
+    if (is_codex_endpoint) {
+        if (system_prompt) |sp| {
+            try body.writer().writeAll(",\"instructions\":");
+            try writeJson(body.writer(), sp);
+        }
     }
     if (options.text_verbosity) |verbosity| {
         try body.writer().writeAll(",\"text\":");
@@ -469,6 +469,18 @@ fn streamOpenAIResponsesBase(
                     _ = try cachedNormalizedToolCallId(allocator, tc.id, &tool_call_ids);
                 }
             }
+        }
+    }
+
+    var first = true;
+    if (!is_codex_endpoint) {
+        if (system_prompt) |sp| {
+            try body.writer().writeAll("{\"role\":");
+            try writeJson(body.writer(), responseSystemRole(model));
+            try body.writer().writeAll(",\"content\":");
+            try writeJson(body.writer(), sp);
+            try body.writer().writeAll("}");
+            first = false;
         }
     }
 
@@ -535,6 +547,25 @@ fn streamOpenAIResponsesBase(
         try body.writer().writeAll("],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
     }
     try body.writer().writeAll("}");
+    return body.toOwnedSlice();
+}
+
+fn streamOpenAIResponsesBase(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    model: types.Model,
+    context: types.Context,
+    options: types.StreamOptions,
+    endpoint: []const u8,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    const api_key = options.api_key orelse return error.MissingApiKey;
+    const is_codex_endpoint = std.mem.endsWith(u8, endpoint, "/codex/responses");
+    const account_id = if (is_codex_endpoint) extractCodexAccountId(allocator, api_key) catch null else null;
+    defer if (account_id) |aid| allocator.free(aid);
+
+    const request_body = try buildResponsesRequestBody(allocator, model, context, options, endpoint);
+    defer allocator.free(request_body);
 
     var attempt: usize = 0;
     attempt_loop: while (attempt <= MAX_RETRIES) : (attempt += 1) {
@@ -547,7 +578,7 @@ fn streamOpenAIResponsesBase(
         try appendHeader(&request_headers, "content-type", "application/json");
         try appendHeader(&request_headers, "accept", "text/event-stream");
 
-        if (is_codox_endpoint) {
+        if (is_codex_endpoint) {
             if (account_id) |account| {
                 try appendHeader(&request_headers, "chatgpt-account-id", account);
             }
@@ -570,7 +601,7 @@ fn streamOpenAIResponsesBase(
         });
         defer req.deinit();
 
-        req.sendBodyComplete(body.items) catch |err| {
+        req.sendBodyComplete(request_body) catch |err| {
             if (attempt < MAX_RETRIES) {
                 const delay_ms = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
@@ -889,4 +920,73 @@ test "codex tool-call ids are sanitized and mapped" {
     const normalized = try normalizeToolCallId(allocator, "call with spaces|MyToolId");
     defer allocator.free(normalized);
     try std.testing.expect(std.mem.eql(u8, normalized, "call_with_spaces|fc_MyToolId"));
+}
+
+test "openai responses request uses developer role system message and omits instructions" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-5.3-codex",
+        .name = "GPT-5.3 Codex",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const messages: []const types.Message = &.{
+        .{ .role = .user, .content = "hello" },
+    };
+    const context: types.Context = .{
+        .system_prompt = "sys",
+        .messages = messages,
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{},
+        "https://api.openai.com/v1/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"sys\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\"") == null);
+}
+
+test "codex responses request uses instructions and omits developer role" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-5.3-codex",
+        .name = "GPT-5.3 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const messages: []const types.Message = &.{
+        .{ .role = .user, .content = "hello" },
+    };
+    const context: types.Context = .{
+        .system_prompt = "sys",
+        .messages = messages,
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{},
+        "https://chatgpt.com/backend-api/codex/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"sys\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") == null);
 }

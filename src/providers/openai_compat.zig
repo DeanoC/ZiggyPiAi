@@ -53,6 +53,34 @@ fn mapStopReason(s: []const u8) types.StopReason {
     return .err;
 }
 
+fn hasCompatDomain(base_url: []const u8, domain: []const u8) bool {
+    return std.mem.indexOf(u8, base_url, domain) != null;
+}
+
+fn supportsDeveloperRole(model: types.Model) bool {
+    const provider = model.provider;
+    const base_url = model.base_url;
+
+    const is_zai = std.mem.eql(u8, provider, "zai") or hasCompatDomain(base_url, "api.z.ai");
+    const is_non_standard = std.mem.eql(u8, provider, "cerebras") or
+        hasCompatDomain(base_url, "cerebras.ai") or
+        std.mem.eql(u8, provider, "xai") or
+        hasCompatDomain(base_url, "api.x.ai") or
+        std.mem.eql(u8, provider, "mistral") or
+        hasCompatDomain(base_url, "mistral.ai") or
+        hasCompatDomain(base_url, "chutes.ai") or
+        hasCompatDomain(base_url, "deepseek.com") or
+        is_zai or
+        std.mem.eql(u8, provider, "opencode") or
+        hasCompatDomain(base_url, "opencode.ai");
+    return !is_non_standard;
+}
+
+fn systemPromptRole(model: types.Model) []const u8 {
+    if (model.reasoning and supportsDeveloperRole(model)) return "developer";
+    return "system";
+}
+
 fn appendList(dst: *std.array_list.Managed(u8), src: []const u8) !void {
     if (src.len == 0) return;
     try dst.appendSlice(src);
@@ -547,7 +575,9 @@ pub fn streamOpenAICompat(
     }
 
     if (context.system_prompt) |system_prompt| {
-        try body.writer().writeAll("{\"role\":\"system\",\"content\":");
+        try body.writer().writeAll("{\"role\":");
+        try writeJson(body.writer(), systemPromptRole(model));
+        try body.writer().writeAll(",\"content\":");
         try writeJson(body.writer(), system_prompt);
         try body.writer().writeAll("}");
         first = false;
@@ -841,4 +871,34 @@ test "parseSSEFrames preserves unicode content" {
         .done => |done| try std.testing.expect(std.mem.indexOf(u8, done.text, "Hello ") != null),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "openai compat system role uses developer for reasoning openai model" {
+    const model: types.Model = .{
+        .id = "gpt-5",
+        .name = "GPT-5",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    try std.testing.expectEqualStrings("developer", systemPromptRole(model));
+}
+
+test "openai compat system role falls back to system for non-standard provider" {
+    const model: types.Model = .{
+        .id = "qwen-coder",
+        .name = "Qwen Coder",
+        .api = "openai-completions",
+        .provider = "opencode",
+        .base_url = "https://api.opencode.ai/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    try std.testing.expectEqualStrings("system", systemPromptRole(model));
 }
