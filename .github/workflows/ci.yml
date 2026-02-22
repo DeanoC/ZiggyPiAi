@@ -6,22 +6,11 @@ on:
 
 jobs:
   zig-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Zig
-        run: |
-          ZIG_VERSION=0.15.1
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
-      - name: Run Unit Test Suite
-        run: zig build test
-      - name: Run Targeted Integration Tests
-        run: |
-          zig test src/integration_test.zig --test-filter "openai responses integration"
-          zig test src/integration_test.zig --test-filter "codex spark originator integration"
-      - name: Run Model Sync Checker
-        run: ./scripts/check-model-sync.sh
+    uses: DeanoC/ZiggySpiderweb/.github/workflows/ziggy-shared-ci.yml@main
+    with:
+      build_command: zig build
+      test_command: zig build test
+      extra_commands: |
+        zig test src/integration_test.zig --test-filter "openai responses integration"
+        zig test src/integration_test.zig --test-filter "codex spark originator integration"
+        ./scripts/check-model-sync.sh
