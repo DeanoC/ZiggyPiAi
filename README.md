@@ -6,9 +6,28 @@ Zig port/inspired version of typescript library `pi-mono/packages/ai`.
 
 - `zig build` to inspect the targets defined in `build.zig`.
 - `zig build test` runs the module/unit tests wired into the build graph.
+- `zig build example-oauth-login -- --help` shows a runnable OAuth login surface example that integrators can adapt in their own apps.
 - `zig test src/main.zig` runs the lightweight local unit suite directly.
 - `zig test src/integration_test.zig` runs the integration suite. Most of those tests hit mocked servers and pass without any external credentials; the codex and kimi live smoke tests are skipped unless you opt into them (see below).
 - `./scripts/check-model-sync.sh` verifies critical model IDs are still aligned with `pi-mono/packages/ai/src/models.generated.ts` when that source is available locally.
+
+## OAuth Login Surface Example
+
+`ZiggyPiAi` stays as a library; app-level surfaces should be provided by the integrator.
+
+An example implementation is included at `examples/oauth_login.zig` and can be run with:
+
+```bash
+zig build example-oauth-login -- openai-codex
+zig build example-oauth-login -- github-copilot --enterprise-domain github.example.com
+```
+
+What this example demonstrates:
+
+- Provider selection and argument parsing in an app-owned CLI surface
+- Auth-code flow handling for OpenAI Codex, Anthropic, Google Gemini CLI, and Google Antigravity
+- Device flow handling for GitHub Copilot
+- Persisting OAuth credentials into `~/.pi/agent/auth.json` using `provider_oauth.savePiOAuthCredentials`
 
 ## OAuth & API key handling
 
