@@ -1,38 +1,48 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
+This repository is part of the Ziggy* codebase and is primarily a Zig project.
 
-- `build.zig` defines the Zig build steps; `build.zig.zon` houses generated metadata.
-- `src/` contains all Zig code: `main.zig`, `lib.zig`, registry helpers, providers, and the integration test (`src/integration_test.zig`); no other languages are present.
-- `README.md` documents setup, OAuth handling, and how to opt into live smoke tests; add changes there when workflows evolve.
-- `env`-related files such as `.env` or `code/auth.json` are ignored; secrets land in the home `.codex/auth.json` when using Codex OAuth.
+- `src/` contains runtime/library source files.
+- `build.zig` defines build targets and dependency wiring.
+- `build.zig.zon` contains package metadata and dependency pins.
+- `README.md` documents setup, architecture notes, and usage.
+- Tests are implemented with Zig `test` blocks and, where present, files under `tests/`.
 
 ## Build, Test, and Development Commands
-
-- `zig build` reports available artifacts wired through `build.zig` (currently exposes the library and its tests).
-- `zig build test` respects build-defined dependencies and runs the module/unit tests in the library.
-- `zig test src/main.zig` executes the minimal unit suite bundled with the CLI entry point.
-- `zig test src/integration_test.zig` exercises the provider registry, stream parsing, and mocks a streaming OpenAI Responses endpoint; set `ZIGGY_RUN_LIVE_CODEX_TEST=1`/`ZIGGY_RUN_LIVE_KIMI_TEST=1` when testing live endpoints.
+- `zig build` - build all configured artifacts for this repository.
+- `zig build test` - run the repository test suite.
+- `zig build --release=safe` - build optimized safe artifacts.
+- `zig fmt src/*.zig` - format Zig source files.
+- If source code changes, run `zig build` and `zig build test` and confirm both pass before pushing.
 
 ## Coding Style & Naming Conventions
-
-- Follow Zig idioms: snake_case for functions/variables, PascalCase for `struct` types, and `const` for immutable bindings.
-- Keep indentation to four spaces (aligns with Zig defaults) and prefer short helper functions for clarity.
-- No formatter beyond Zig’s built-in suggestions; rely on `zig fmt` if you transform a file.
-- Keep provider-specific logic isolated in `src/providers/`; helper modules live in root-level directories (e.g., `stream.zig`, `models.zig`).
+- Follow Zig style and keep code `zig fmt` clean.
+- Use `snake_case` for functions/variables/constants where possible.
+- Use `PascalCase` for public types (`struct`, `enum`, `union`).
+- Prefer explicit error handling with `try`/`catch` and early returns.
+- Keep functions focused and add concise comments only where behavior is non-obvious.
 
 ## Testing Guidelines
-
-- Tests live alongside code in Zig’s test blocks (`test "description"`). The integration suite lives in `src/integration_test.zig`.
-- Name tests descriptively; include the provider or scenario in the string (e.g., `"openai responses integration"`).
-- Run `zig test src/integration_test.zig` locally before pushing and document any skipped live tests in PRs.
+- Add tests close to the changed behavior using descriptive names.
+- Prefer focused tests with deterministic inputs.
+- For behavior changes, include both success and failure-path coverage where practical.
+- Run `zig build test` before opening or updating a PR.
 
 ## Commit & Pull Request Guidelines
+- Use clear, imperative commit messages (Conventional prefixes like `feat:`, `fix:`, `refactor:` are preferred).
+- PR descriptions should include:
+  - Summary of purpose and impact.
+  - Commands run (`zig build`, `zig build test`).
+  - Notes on compatibility/config changes when relevant.
 
-- Commit messages stay simple and descriptive (e.g., “Add Codex OAuth helper” or “Document live test gating”).
-- Open PRs from branches named after the effort (e.g., `feature/codex-oauth`); always include a summary, mention relevant issues, and note any required env setup or skipped tests.
+## Branch Protection And Review Gate
+- Direct pushes to `main` are not allowed.
+- All changes that update `main` must go through a pull request.
+- A PR must not be merged until `chatgpt-codex-connector` (including variants like `chatgpt-codex-connector[bot]`) has reviewed it.
+- Do not merge while any review comments from that reviewer remain outstanding.
+- Address each comment and resolve each review thread before merging.
 
-## Security & Configuration Tips
-
-- Store credentials in environment variables (`OPENAI_API_KEY`, `OPENAI_CODEX_API_KEY`, `KIMICODE_API_KEY`, etc.) or in `~/.codex/auth.json` for Codex OAuth.
-- Avoid committing `.env` files or auth artifacts; the `.gitignore` already blocks them.
+## Compatibility Policy
+- Until `1.0.0`, backward compatibility is not guaranteed.
+- Breaking changes are allowed during early development, but should be documented in PR notes.
