@@ -44,6 +44,7 @@ fn readDotEnvKey(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
         if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
             value = value[1 .. value.len - 1];
         }
+        if (value.len == 0) return null;
         return allocator.dupe(u8, value) catch return null;
     }
     return null;
@@ -51,7 +52,13 @@ fn readDotEnvKey(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
 
 fn loadOpenAiApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     const env_value = std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
-    if (env_value) |value| return value;
+    if (env_value) |value| {
+        if (value.len == 0) {
+            allocator.free(value);
+            return null;
+        }
+        return value;
+    }
     return readDotEnvKey(allocator, "OPENAI_API_KEY");
 }
 
