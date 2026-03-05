@@ -1388,6 +1388,28 @@ pub fn registerSupportedModelsFromTs(registry: anytype) !void {
         .max_tokens = 128000,
     });
     try registry.register(.{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
+        .context_window = 1000000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
+        .id = "gpt-5.4_smallcontext",
+        .name = "GPT-5.4 Small Context",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
+        .context_window = 272000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
         .id = "gpt-5.3-codex",
         .name = "GPT-5.3 Codex",
         .api = "azure-openai-responses",
@@ -3214,6 +3236,28 @@ pub fn registerSupportedModelsFromTs(registry: anytype) !void {
         .max_tokens = 128000,
     });
     try registry.register(.{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
+        .context_window = 1000000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
+        .id = "gpt-5.4_smallcontext",
+        .name = "GPT-5.4 Small Context",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
+        .context_window = 272000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
         .id = "gpt-5.3-codex",
         .name = "GPT-5.3 Codex",
         .api = "openai-responses",
@@ -3375,6 +3419,28 @@ pub fn registerSupportedModelsFromTs(registry: anytype) !void {
         .base_url = "https://chatgpt.com/backend-api",
         .reasoning = true,
         .cost = .{ .input = 1.75, .output = 14, .cache_read = 0.175, .cache_write = 0 },
+        .context_window = 272000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
+        .context_window = 1000000,
+        .max_tokens = 128000,
+    });
+    try registry.register(.{
+        .id = "gpt-5.4_smallcontext",
+        .name = "GPT-5.4 Small Context",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .cost = .{ .input = 2.5, .output = 15, .cache_read = 0.25, .cache_write = 0 },
         .context_window = 272000,
         .max_tokens = 128000,
     });

@@ -34,6 +34,8 @@ require_in_file() {
 for model_id in \
   "gpt-4.1-mini" \
   "gpt-5.1-codex-mini" \
+  "gpt-5.4" \
+  "gpt-5.4_smallcontext" \
   "gpt-5.3-codex" \
   "gpt-5.3-codex-spark"
 do

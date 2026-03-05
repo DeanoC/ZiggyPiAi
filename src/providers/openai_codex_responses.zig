@@ -86,7 +86,7 @@ fn isRetryableError(status: std.http.Status, error_text: []const u8) bool {
 
 fn clampReasoningEffort(model_id: []const u8, effort: []const u8) []const u8 {
     const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |idx| model_id[idx + 1 ..] else model_id;
-    if ((std.mem.startsWith(u8, id, "gpt-5.2") or std.mem.startsWith(u8, id, "gpt-5.3")) and std.mem.eql(u8, effort, "minimal")) return "low";
+    if ((std.mem.startsWith(u8, id, "gpt-5.2") or std.mem.startsWith(u8, id, "gpt-5.3") or std.mem.startsWith(u8, id, "gpt-5.4")) and std.mem.eql(u8, effort, "minimal")) return "low";
     if (std.mem.eql(u8, id, "gpt-5.1") and std.mem.eql(u8, effort, "xhigh")) return "high";
     if (std.mem.eql(u8, id, "gpt-5.1-codex-mini")) {
         if (std.mem.eql(u8, effort, "high") or std.mem.eql(u8, effort, "xhigh")) return "high";
@@ -949,14 +949,14 @@ test "codex tool-call ids are sanitized and mapped" {
 test "openai responses request uses developer role system message and omits instructions" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
         .api = "openai-responses",
         .provider = "openai",
         .base_url = "https://api.openai.com/v1",
         .reasoning = true,
         .cost = .{ .input = 0.0, .output = 0.0 },
-        .context_window = 1,
+        .context_window = 1_000_000,
         .max_tokens = 1,
     };
     const messages: []const types.Message = &.{
@@ -1018,14 +1018,14 @@ test "openai responses request uses system role for non-standard reasoning provi
 test "codex responses request uses instructions and omits developer role" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
         .api = "openai-codex-responses",
         .provider = "openai-codex",
         .base_url = "https://chatgpt.com/backend-api",
         .reasoning = true,
         .cost = .{ .input = 0.0, .output = 0.0 },
-        .context_window = 1,
+        .context_window = 1_000_000,
         .max_tokens = 1,
     };
     const messages: []const types.Message = &.{

@@ -59,7 +59,7 @@ pub const ModelRegistry = struct {
 };
 
 pub fn supportsXhigh(model: types.Model) bool {
-    if (std.mem.indexOf(u8, model.id, "gpt-5.2") != null or std.mem.indexOf(u8, model.id, "gpt-5.3") != null) {
+    if (std.mem.indexOf(u8, model.id, "gpt-5.2") != null or std.mem.indexOf(u8, model.id, "gpt-5.3") != null or std.mem.indexOf(u8, model.id, "gpt-5.4") != null) {
         return true;
     }
 
@@ -238,6 +238,8 @@ test "registerDefaultModels includes openai-codex variants" {
     const mini = registry.getModel("openai-codex", "gpt-5.1-codex-mini");
     const v5_1 = registry.getModel("openai-codex", "gpt-5.1");
     const v5_2 = registry.getModel("openai-codex", "gpt-5.2");
+    const v5_4 = registry.getModel("openai-codex", "gpt-5.4");
+    const v5_4_small = registry.getModel("openai-codex", "gpt-5.4_smallcontext");
     const v5_3 = registry.getModel("openai-codex", "gpt-5.3-codex");
     const spark = registry.getModel("openai-codex", "gpt-5.3-codex-spark");
     const chatgpt_spark = registry.getModel("openai-codex-spark", "chatgpt5.3-spark");
@@ -255,6 +257,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(mini != null);
     try std.testing.expect(v5_1 != null);
     try std.testing.expect(v5_2 != null);
+    try std.testing.expect(v5_4 != null);
+    try std.testing.expect(v5_4_small != null);
     try std.testing.expect(v5_3 != null);
     try std.testing.expect(spark != null);
     try std.testing.expect(chatgpt_spark != null);
@@ -271,6 +275,8 @@ test "registerDefaultModels includes openai-codex variants" {
     try std.testing.expect(std.mem.eql(u8, mini.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, v5_1.?.provider, "openai-codex"));
     try std.testing.expect(std.mem.eql(u8, v5_2.?.provider, "openai-codex"));
+    try std.testing.expect(std.mem.eql(u8, v5_4.?.provider, "openai-codex"));
+    try std.testing.expect(std.mem.eql(u8, v5_4_small.?.provider, "openai-codex"));
     try std.testing.expect(std.mem.eql(u8, spark.?.api, "openai-codex-responses"));
     try std.testing.expect(std.mem.eql(u8, chatgpt_spark.?.provider, "openai-codex-spark"));
     try std.testing.expect(std.mem.eql(u8, google.?.api, "google-generative-ai"));
@@ -286,15 +292,15 @@ test "registerDefaultModels includes openai-codex variants" {
 }
 
 test "supportsXhigh matches TS behavior" {
-    const gpt_5_3: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
+    const gpt_5_4: types.Model = .{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
         .api = "openai-codex-responses",
         .provider = "openai-codex",
         .base_url = "https://chatgpt.com/backend-api",
         .reasoning = true,
         .cost = .{ .input = 0, .output = 0 },
-        .context_window = 272_000,
+        .context_window = 1_000_000,
         .max_tokens = 128_000,
     };
     const gpt_5_1: types.Model = .{
@@ -331,7 +337,7 @@ test "supportsXhigh matches TS behavior" {
         .max_tokens = 32_000,
     };
 
-    try std.testing.expect(supportsXhigh(gpt_5_3));
+    try std.testing.expect(supportsXhigh(gpt_5_4));
     try std.testing.expect(!supportsXhigh(gpt_5_1));
     try std.testing.expect(supportsXhigh(anthropic_opus));
     try std.testing.expect(!supportsXhigh(openrouter_opus));
@@ -339,8 +345,8 @@ test "supportsXhigh matches TS behavior" {
 
 test "modelsAreEqual compares provider and id" {
     const model_a: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
         .api = "openai-codex-responses",
         .provider = "openai-codex",
         .base_url = "https://chatgpt.com/backend-api",
@@ -350,8 +356,8 @@ test "modelsAreEqual compares provider and id" {
         .max_tokens = 128_000,
     };
     const model_b: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex duplicate",
+        .id = "gpt-5.4",
+        .name = "GPT-5.4 duplicate",
         .api = "openai-codex-responses",
         .provider = "openai-codex",
         .base_url = "https://chatgpt.com/backend-api",
@@ -361,8 +367,8 @@ test "modelsAreEqual compares provider and id" {
         .max_tokens = 128_000,
     };
     const model_other_provider: types.Model = .{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
         .api = "openai-responses",
         .provider = "openai",
         .base_url = "https://api.openai.com/v1",
@@ -403,9 +409,9 @@ test "findModel resolves exact, provider scoped, and fuzzy queries" {
     try std.testing.expect(exact != null);
     try std.testing.expect(std.mem.eql(u8, exact.?.provider, "openai-codex"));
 
-    const scoped = findModel(&registry, null, "openai-codex/gpt-5.3-codex");
+    const scoped = findModel(&registry, null, "openai-codex/gpt-5.4");
     try std.testing.expect(scoped != null);
-    try std.testing.expect(std.mem.eql(u8, scoped.?.id, "gpt-5.3-codex"));
+    try std.testing.expect(std.mem.eql(u8, scoped.?.id, "gpt-5.4"));
 
     const provider_scoped = findModel(&registry, "openai-codex-spark", "chatgpt5.3");
     try std.testing.expect(provider_scoped != null);
