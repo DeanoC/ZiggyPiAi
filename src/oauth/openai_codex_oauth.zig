@@ -64,10 +64,10 @@ fn decodeJwtExpiration(token: []const u8) ?u64 {
     _ = parts.next();
     const payload = parts.next() orelse return null;
 
-    const decoded_len = std.base64.url_safe.Decoder.calcSizeForSlice(payload) catch return null;
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch return null;
     const decoded = std.heap.page_allocator.alloc(u8, decoded_len) catch return null;
     defer std.heap.page_allocator.free(decoded);
-    std.base64.url_safe.Decoder.decode(decoded, payload) catch return null;
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, decoded, .{}) catch return null;
     defer parsed.deinit();
@@ -146,7 +146,16 @@ pub fn writeCodexAuthFile(auth_path: []const u8, tokens: CodexAuthTokens) !void 
 }
 
 pub fn needsRefresh(tokens: CodexAuthTokens) bool {
-    return std.time.milliTimestamp() >= tokens.expires_at_ms - (2 * 60 * 1000);
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms < 0) return true;
+
+    const refresh_lead_ms: u64 = 2 * 60 * 1000;
+    const refresh_at_ms = if (tokens.expires_at_ms > refresh_lead_ms)
+        tokens.expires_at_ms - refresh_lead_ms
+    else
+        0;
+
+    return @as(u64, @intCast(now_ms)) >= refresh_at_ms;
 }
 
 fn refreshCodexAuthTokens(allocator: std.mem.Allocator, auth_path: []const u8, tokens: CodexAuthTokens) ?CodexAuthTokens {
@@ -315,10 +324,10 @@ pub fn extractAccountId(allocator: std.mem.Allocator, access_token: []const u8) 
     _ = parts.next() orelse return error.InvalidToken;
     const payload = parts.next() orelse return error.InvalidToken;
 
-    const decoded_len = std.base64.url_safe.Decoder.calcSizeForSlice(payload) catch return error.InvalidToken;
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch return error.InvalidToken;
     const decoded = try allocator.alloc(u8, decoded_len);
     defer allocator.free(decoded);
-    std.base64.url_safe.Decoder.decode(decoded, payload) catch return error.InvalidToken;
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch return error.InvalidToken;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, decoded, .{});
     defer parsed.deinit();
@@ -504,4 +513,77 @@ test "parseAuthorizationInput handles query and raw code" {
     }
     try std.testing.expect(parsed_raw.code != null);
     try std.testing.expectEqualStrings("just-a-code", parsed_raw.code.?);
+}
+
+test "needsRefresh handles short expiries without underflow" {
+    const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+
+    try std.testing.expect(needsRefresh(.{
+        .access_token = "access",
+        .refresh_token = "refresh",
+        .id_token = null,
+        .account_id = null,
+        .expires_at_ms = 0,
+    }));
+
+    try std.testing.expect(needsRefresh(.{
+        .access_token = "access",
+        .refresh_token = "refresh",
+        .id_token = null,
+        .account_id = null,
+        .expires_at_ms = now_ms + 60_000,
+    }));
+
+    try std.testing.expect(!needsRefresh(.{
+        .access_token = "access",
+        .refresh_token = "refresh",
+        .id_token = null,
+        .account_id = null,
+        .expires_at_ms = now_ms + 10 * 60_000,
+    }));
+}
+
+test "readCodexAuthFile parses unpadded jwt expiration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const auth_file = try tmp.dir.createFile("auth.json", .{});
+    defer auth_file.close();
+
+    const header_json = "{\"alg\":\"none\"}";
+    const payload_json =
+        "{\"exp\":4102444800,\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct-123\"}}";
+    const header_encoded = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(header_json.len));
+    defer allocator.free(header_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(header_encoded, header_json);
+
+    const payload_encoded = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload_json.len));
+    defer allocator.free(payload_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(payload_encoded, payload_json);
+
+    const access_token = try std.fmt.allocPrint(allocator, "{s}.{s}.sig", .{ header_encoded, payload_encoded });
+    defer allocator.free(access_token);
+    const auth_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"OPENAI_API_KEY\":null,\"tokens\":{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-token\"}}}}",
+        .{access_token},
+    );
+    defer allocator.free(auth_json);
+    try auth_file.writeAll(auth_json);
+
+    const cwd_realpath = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_realpath);
+    const full_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/auth.json",
+        .{ cwd_realpath, tmp.sub_path },
+    );
+    defer allocator.free(full_path);
+
+    var tokens = readCodexAuthFile(allocator, full_path) orelse return error.TestExpectedEqual;
+    defer freeCodexAuthTokens(allocator, &tokens);
+
+    try std.testing.expectEqual(@as(u64, 4_102_444_800_000), tokens.expires_at_ms);
+    try std.testing.expectEqualStrings("acct-123", tokens.account_id.?);
 }
