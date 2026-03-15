@@ -110,9 +110,16 @@ fn validateGeminiLevel(model: types.Model, level: types.ThinkingLevel) ![]const 
     return tag;
 }
 
+fn hasThinkingBudgetValue(thinking_budget: ?types.ThinkingBudget) bool {
+    if (thinking_budget) |budget| {
+        return budget.tokens != null or budget.level != null;
+    }
+    return false;
+}
+
 fn resolveThinkingConfig(model: types.Model, options: types.StreamOptions) !?GoogleThinkingConfig {
     if (options.gemini_thinking) |gemini_thinking| {
-        if (options.thinking_budget != null) return error.InvalidGeminiThinkingConfiguration;
+        if (hasThinkingBudgetValue(options.thinking_budget)) return error.InvalidGeminiThinkingConfiguration;
         if (!isGeminiModel(model)) return error.InvalidGeminiThinkingConfiguration;
 
         return switch (gemini_thinking) {
@@ -1222,6 +1229,44 @@ test "google request body rejects conflicting gemini thinking controls" {
         false,
         false,
     ));
+}
+
+test "google request body ignores empty thinking budget when gemini thinking is set" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const model: types.Model = .{
+        .id = "gemini-3-flash",
+        .name = "Gemini 3 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        model,
+        context,
+        .{
+            .thinking_budget = .{},
+            .gemini_thinking = .{ .level = .low },
+        },
+        true,
+        false,
+        false,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingConfig\":{\"thinkingLevel\":\"low\"}") != null);
 }
 
 test "google request body rejects unsupported gemini pro thinking levels" {
