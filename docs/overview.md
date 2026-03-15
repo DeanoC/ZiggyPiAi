@@ -38,6 +38,45 @@ It demonstrates:
 - Kimi routes use `KIMICODE_API_KEY` with `KIMI_API_KEY` / `ANTHROPIC_API_KEY` fallbacks.
 - Azure OpenAI uses `AZURE_OPENAI_API_KEY`.
 
+### OAuth Registry
+
+The OAuth surface is now routed through `src/oauth/registry.zig`.
+
+- Built-in providers register through the same registry used by custom providers.
+- `oauth/registry.zig` owns auth start, token exchange, refresh, API-key formatting, and persisted `~/.pi/agent/auth.json` refresh behavior.
+- `oauth/provider_oauth.zig` remains as a compatibility wrapper for existing callers, but delegates to the registry.
+
+Minimal custom-provider sketch:
+
+```zig
+const oauth_registry = ziggy_piai.oauth.registry;
+
+try oauth_registry.registerOAuthProvider(.{
+    .name = "custom-oauth",
+    .refresh_token = struct {
+        fn refresh(allocator: std.mem.Allocator, params: oauth_registry.RefreshTokenParams) !oauth_registry.TokenSet {
+            _ = params;
+            return .{
+                .access = try allocator.dupe(u8, "access"),
+                .refresh = try allocator.dupe(u8, "refresh"),
+                .expires_at_ms = 4_102_444_800_000,
+            };
+        }
+    }.refresh,
+});
+```
+
+Useful registry entry points:
+
+- `registerOAuthProvider`
+- `unregisterOAuthProvider`
+- `getOAuthProvider`
+- `listOAuthProviders`
+- `resetOAuthProvidersForTests`
+- `beginAuth`
+- `exchangeToken`
+- `refreshToken`
+
 ## Integration Tests
 
 - `ZIGGY_RUN_LIVE_CODEX_TEST=1` enables live Codex smoke tests.

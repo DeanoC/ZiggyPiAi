@@ -821,3 +821,54 @@ test "oauth registry resolves custom provider auth entries without core edits" {
     unregisterOAuthProvider("custom-oauth");
     try std.testing.expect(getOAuthProvider("custom-oauth") == null);
 }
+
+test "oauth registry reset removes custom providers and restores builtins" {
+    const Custom = struct {
+        fn refresh(allocator: std.mem.Allocator, params: RefreshTokenParams) !TokenSet {
+            _ = params;
+            return .{
+                .access = try allocator.dupe(u8, "custom-access"),
+                .refresh = try allocator.dupe(u8, "custom-refresh"),
+                .expires_at_ms = 4_102_444_800_000,
+            };
+        }
+    };
+
+    defer resetOAuthProvidersForTests();
+    try registerOAuthProvider(.{
+        .name = "custom-reset-provider",
+        .refresh_token = Custom.refresh,
+    });
+
+    try std.testing.expect(getOAuthProvider("custom-reset-provider") != null);
+    resetOAuthProvidersForTests();
+    try std.testing.expect(getOAuthProvider("custom-reset-provider") == null);
+    try std.testing.expect(getOAuthProvider("openai-codex") != null);
+    try std.testing.expect(getOAuthProvider("github-copilot") != null);
+}
+
+test "oauth registry surfaces unsupported operation errors" {
+    const Custom = struct {
+        fn refresh(allocator: std.mem.Allocator, params: RefreshTokenParams) !TokenSet {
+            _ = params;
+            return .{
+                .access = try allocator.dupe(u8, "refresh-only-access"),
+                .refresh = try allocator.dupe(u8, "refresh-only-refresh"),
+                .expires_at_ms = 4_102_444_800_000,
+            };
+        }
+    };
+
+    defer resetOAuthProvidersForTests();
+    try registerOAuthProvider(.{
+        .name = "refresh-only-provider",
+        .refresh_token = Custom.refresh,
+    });
+
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.OAuthBeginNotSupported, beginAuth(allocator, "refresh-only-provider", .{}));
+    try std.testing.expectError(error.OAuthExchangeNotSupported, exchangeToken(allocator, "refresh-only-provider", .{}));
+    try std.testing.expectError(error.OAuthProviderNotRegistered, refreshToken(allocator, "missing-provider", .{
+        .refresh_token = "missing",
+    }));
+}
