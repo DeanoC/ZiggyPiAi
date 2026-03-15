@@ -91,6 +91,11 @@ pub const ThinkingBudget = struct {
     level: ?ThinkingLevel = null,
 };
 
+pub const GeminiThinking = union(enum) {
+    budget_tokens: u32,
+    level: ThinkingLevel,
+};
+
 pub const MetadataEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -135,6 +140,7 @@ pub const StreamOptions = struct {
     max_retry_delay_ms: ?u32 = null,
     metadata: ?[]const MetadataEntry = null,
     thinking_budget: ?ThinkingBudget = null,
+    gemini_thinking: ?GeminiThinking = null,
     on_payload: ?*const fn (ctx: ?*anyopaque, payload: ProviderPayload) anyerror!void = null,
     on_payload_ctx: ?*anyopaque = null,
 };
@@ -253,6 +259,7 @@ test "stream options include parity defaults" {
     try std.testing.expect(opts.max_retry_delay_ms == null);
     try std.testing.expect(opts.metadata == null);
     try std.testing.expect(opts.thinking_budget == null);
+    try std.testing.expect(opts.gemini_thinking == null);
     try std.testing.expect(opts.on_payload == null);
     try std.testing.expect(opts.on_payload_ctx == null);
 }
@@ -264,4 +271,13 @@ test "thinking budget can use tokens or level" {
     try std.testing.expect(level_budget.tokens == null);
     try std.testing.expect(token_budget.tokens == 2048);
     try std.testing.expect(token_budget.level == null);
+}
+
+test "gemini thinking can use budget tokens or level" {
+    const level_thinking: GeminiThinking = .{ .level = .medium };
+    const budget_thinking: GeminiThinking = .{ .budget_tokens = 4096 };
+    try std.testing.expect(level_thinking == .level);
+    try std.testing.expect(level_thinking.level == .medium);
+    try std.testing.expect(budget_thinking == .budget_tokens);
+    try std.testing.expectEqual(@as(u32, 4096), budget_thinking.budget_tokens);
 }

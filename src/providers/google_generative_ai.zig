@@ -74,6 +74,71 @@ fn mappedThinkingBudget(options: types.StreamOptions) ?u32 {
     return null;
 }
 
+const GoogleThinkingConfig = union(enum) {
+    budget_tokens: u32,
+    level: []const u8,
+};
+
+fn isGeminiModel(model: types.Model) bool {
+    return containsCaseInsensitive(model.id, "gemini-");
+}
+
+fn isGemini3Model(model: types.Model) bool {
+    return containsCaseInsensitive(model.id, "gemini-3");
+}
+
+fn isGemini3ProModel(model: types.Model) bool {
+    return containsCaseInsensitive(model.id, "gemini-3-pro");
+}
+
+fn geminiLevelTag(level: types.ThinkingLevel) ?[]const u8 {
+    return switch (level) {
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => null,
+    };
+}
+
+fn validateGeminiLevel(model: types.Model, level: types.ThinkingLevel) ![]const u8 {
+    const tag = geminiLevelTag(level) orelse return error.InvalidGeminiThinkingLevel;
+    if (!isGeminiModel(model) or !isGemini3Model(model)) return error.InvalidGeminiThinkingConfiguration;
+    if (isGemini3ProModel(model) and (level == .minimal or level == .medium)) {
+        return error.InvalidGeminiThinkingLevel;
+    }
+    return tag;
+}
+
+fn resolveThinkingConfig(model: types.Model, options: types.StreamOptions) !?GoogleThinkingConfig {
+    if (options.gemini_thinking) |gemini_thinking| {
+        if (options.thinking_budget != null) return error.InvalidGeminiThinkingConfiguration;
+        if (!isGeminiModel(model)) return error.InvalidGeminiThinkingConfiguration;
+
+        return switch (gemini_thinking) {
+            .budget_tokens => |tokens| .{ .budget_tokens = tokens },
+            .level => |level| .{ .level = try validateGeminiLevel(model, level) },
+        };
+    }
+
+    if (options.thinking_budget) |budget| {
+        if (budget.tokens) |tokens| {
+            return .{ .budget_tokens = tokens };
+        }
+        if (budget.level) |level| {
+            if (isGeminiModel(model) and isGemini3Model(model)) {
+                const normalized_level: types.ThinkingLevel = if (level == .xhigh) .high else level;
+                return .{ .level = try validateGeminiLevel(model, normalized_level) };
+            }
+            if (mappedThinkingBudget(options)) |tokens| {
+                return .{ .budget_tokens = tokens };
+            }
+        }
+    }
+
+    return null;
+}
+
 const antigravity_instruction =
     "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
 
@@ -525,6 +590,7 @@ fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
 fn writeGenerateRequestBody(
     allocator: std.mem.Allocator,
     writer: anytype,
+    model: types.Model,
     context: types.Context,
     options: types.StreamOptions,
     include_system_prompt_in_contents: bool,
@@ -588,7 +654,8 @@ fn writeGenerateRequestBody(
         try writer.writeAll("]}]");
     }
 
-    if (options.temperature != null or options.max_tokens != null or mappedThinkingBudget(options) != null) {
+    const thinking_config = try resolveThinkingConfig(model, options);
+    if (options.temperature != null or options.max_tokens != null or thinking_config != null) {
         try writer.writeAll(",\"generationConfig\":{");
         var wrote = false;
         if (options.temperature) |temp| {
@@ -602,11 +669,20 @@ fn writeGenerateRequestBody(
             try writer.print("{d}", .{max_tokens});
             wrote = true;
         }
-        if (mappedThinkingBudget(options)) |budget_tokens| {
+        if (thinking_config) |config| {
             if (wrote) try writer.writeByte(',');
-            try writer.writeAll("\"thinkingConfig\":{\"thinkingBudget\":");
-            try writer.print("{d}", .{budget_tokens});
-            try writer.writeByte('}');
+            switch (config) {
+                .budget_tokens => |budget_tokens| {
+                    try writer.writeAll("\"thinkingConfig\":{\"thinkingBudget\":");
+                    try writer.print("{d}", .{budget_tokens});
+                    try writer.writeByte('}');
+                },
+                .level => |level| {
+                    try writer.writeAll("\"thinkingConfig\":{\"thinkingLevel\":");
+                    try writeJson(writer, level);
+                    try writer.writeByte('}');
+                },
+            }
         }
         try writer.writeAll("}");
     }
@@ -642,7 +718,7 @@ pub fn streamGoogleGenerativeAI(
         defer allocator.free(endpoint_owned);
         try endpoint.appendSlice(endpoint_owned);
         try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), context, options, true, false, false);
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, true, false, false);
         try body.writer().writeByte('}');
     } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
         var creds = try parseGoogleCredentials(allocator, api_key);
@@ -676,7 +752,7 @@ pub fn streamGoogleGenerativeAI(
         try body.writer().writeAll(",\"model\":");
         try writeJson(body.writer(), model.id);
         try body.writer().writeAll(",\"request\":{");
-        try writeGenerateRequestBody(allocator, body.writer(), context, options, false, true, std.mem.eql(u8, model.provider, "google-antigravity"));
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, std.mem.eql(u8, model.provider, "google-antigravity"));
         if (options.session_id) |session_id| {
             try body.writer().writeAll(",\"sessionId\":");
             try writeJson(body.writer(), session_id);
@@ -720,7 +796,7 @@ pub fn streamGoogleGenerativeAI(
         defer allocator.free(endpoint_owned);
         try endpoint.appendSlice(endpoint_owned);
         try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), context, options, false, true, false);
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, false);
         try body.writer().writeByte('}');
     } else {
         return error.ProviderNotSupported;
@@ -1011,6 +1087,18 @@ test "google request body includes thinking budget when configured" {
     var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
 
+    const model: types.Model = .{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
     const context: types.Context = .{
         .messages = &.{.{ .role = .user, .content = "hello" }},
     };
@@ -1018,6 +1106,7 @@ test "google request body includes thinking budget when configured" {
     try writeGenerateRequestBody(
         allocator,
         body.writer(),
+        model,
         context,
         .{ .thinking_budget = .{ .level = .medium } },
         true,
@@ -1026,4 +1115,144 @@ test "google request body includes thinking budget when configured" {
     );
 
     try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingConfig\":{\"thinkingBudget\":8192}") != null);
+}
+
+test "google request body includes gemini thinking level for gemini 3 flash" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const model: types.Model = .{
+        .id = "gemini-3-flash",
+        .name = "Gemini 3 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        model,
+        context,
+        .{ .gemini_thinking = .{ .level = .medium } },
+        true,
+        false,
+        false,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingConfig\":{\"thinkingLevel\":\"medium\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingBudget\"") == null);
+}
+
+test "google request body maps generic thinking level to gemini 3 level" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const model: types.Model = .{
+        .id = "gemini-3-flash",
+        .name = "Gemini 3 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        model,
+        context,
+        .{ .thinking_budget = .{ .level = .high } },
+        true,
+        false,
+        false,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingConfig\":{\"thinkingLevel\":\"high\"}") != null);
+}
+
+test "google request body rejects conflicting gemini thinking controls" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const model: types.Model = .{
+        .id = "gemini-3-flash",
+        .name = "Gemini 3 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try std.testing.expectError(error.InvalidGeminiThinkingConfiguration, writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        model,
+        context,
+        .{
+            .thinking_budget = .{ .tokens = 2048 },
+            .gemini_thinking = .{ .level = .low },
+        },
+        true,
+        false,
+        false,
+    ));
+}
+
+test "google request body rejects unsupported gemini pro thinking levels" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const model: types.Model = .{
+        .id = "gemini-3-pro-preview",
+        .name = "Gemini 3 Pro Preview",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try std.testing.expectError(error.InvalidGeminiThinkingLevel, writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        model,
+        context,
+        .{ .gemini_thinking = .{ .level = .medium } },
+        true,
+        false,
+        false,
+    ));
 }
