@@ -10,19 +10,14 @@ pub const StreamFn = *const fn (
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) anyerror!void;
 
-pub const StreamSimpleFn = *const fn (
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    model: types.Model,
-    context: types.Context,
-    options: types.SimpleStreamOptions,
-    events: *std.array_list.Managed(types.AssistantMessageEvent),
-) anyerror!void;
+pub const StreamSimpleFn = StreamFn;
 
 pub const ApiProvider = struct {
     api: []const u8,
     stream: StreamFn,
     stream_simple: ?StreamSimpleFn = null,
+    supports_sse: bool = true,
+    supports_websocket: bool = false,
 };
 
 pub const ApiRegistry = struct {

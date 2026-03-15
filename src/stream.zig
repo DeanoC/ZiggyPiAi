@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const api_registry_mod = @import("api_registry.zig");
 const model_registry_mod = @import("models.zig");
 const env_api_keys = @import("env_api_keys.zig");
+const payload_hooks = @import("payload_hooks.zig");
 
 fn freeMessageContent(
     allocator: std.mem.Allocator,
@@ -131,6 +132,24 @@ fn freeEventPayloads(allocator: std.mem.Allocator, event: *types.AssistantMessag
     }
 }
 
+fn resolveTransport(provider: api_registry_mod.ApiProvider, requested: types.Transport) !types.Transport {
+    return switch (requested) {
+        .sse => {
+            if (!provider.supports_sse) return error.UnsupportedTransport;
+            return .sse;
+        },
+        .websocket => {
+            if (!provider.supports_websocket) return error.UnsupportedTransport;
+            return .websocket;
+        },
+        .auto => {
+            if (provider.supports_sse) return .sse;
+            if (provider.supports_websocket) return .websocket;
+            return error.UnsupportedTransport;
+        },
+    };
+}
+
 pub fn streamByModel(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -144,6 +163,7 @@ pub fn streamByModel(
     var opts = options;
     var env_key: ?[]const u8 = null;
     defer if (env_key) |k| allocator.free(k);
+    opts.transport = try resolveTransport(provider, opts.transport);
     if (opts.api_key == null) {
         env_key = env_api_keys.getEnvApiKey(allocator, model.provider);
         opts.api_key = env_key;
@@ -172,13 +192,14 @@ pub fn streamSimpleByModel(
     api_registry: *api_registry_mod.ApiRegistry,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     const provider = api_registry.get(model.api) orelse return error.ProviderNotRegistered;
     var opts = options;
     var env_key: ?[]const u8 = null;
     defer if (env_key) |k| allocator.free(k);
+    opts.transport = try resolveTransport(provider, opts.transport);
     if (opts.api_key == null) {
         env_key = env_api_keys.getEnvApiKey(allocator, model.provider);
         opts.api_key = env_key;
@@ -189,16 +210,7 @@ pub fn streamSimpleByModel(
         return;
     }
 
-    try streamByModel(allocator, client, api_registry, model, context, .{
-        .temperature = options.temperature,
-        .max_tokens = options.max_tokens,
-        .api_key = opts.api_key,
-        .reasoning = options.reasoning,
-        .reasoning_summary = options.reasoning_summary,
-        .session_id = options.session_id,
-        .text_verbosity = options.text_verbosity,
-        .headers = options.headers,
-    }, events);
+    try streamByModel(allocator, client, api_registry, model, context, opts, events);
 }
 
 pub fn streamSimpleByProviderModelId(
@@ -209,7 +221,7 @@ pub fn streamSimpleByProviderModelId(
     provider: []const u8,
     model_id: []const u8,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     const model = model_registry.getModel(provider, model_id) orelse return error.ModelNotFound;
@@ -239,7 +251,7 @@ pub fn completeSimpleByModel(
     api_registry: *api_registry_mod.ApiRegistry,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
 ) !types.AssistantMessage {
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
     defer {
@@ -272,7 +284,7 @@ pub fn completeSimpleByProviderModelId(
     provider: []const u8,
     model_id: []const u8,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
 ) !types.AssistantMessage {
     const model = model_registry.getModel(provider, model_id) orelse return error.ModelNotFound;
     return try completeSimpleByModel(allocator, client, api_registry, model, context, options);
@@ -288,7 +300,7 @@ fn fakeStream(
 ) !void {
     _ = client;
     _ = context;
-    try events.append(.{ .done = .{
+    const msg: types.AssistantMessage = .{
         .text = try allocator.dupe(u8, model.id),
         .thinking = "",
         .tool_calls = &.{},
@@ -297,7 +309,8 @@ fn fakeStream(
         .model = model.id,
         .usage = .{},
         .stop_reason = if (options.api_key != null) .stop else .err,
-    } });
+    };
+    try payload_hooks.appendDone(events, options, msg);
 }
 
 fn fakeErrStream(
@@ -320,13 +333,13 @@ fn fakeSimpleStream(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     _ = client;
     _ = model;
     _ = context;
-    try events.append(.{ .done = .{
+    const msg: types.AssistantMessage = .{
         .text = try allocator.dupe(u8, options.reasoning orelse "simple"),
         .thinking = "",
         .tool_calls = &.{},
@@ -335,7 +348,43 @@ fn fakeSimpleStream(
         .model = "simple",
         .usage = .{},
         .stop_reason = if (options.api_key != null) .stop else .err,
+    };
+    try payload_hooks.appendDone(events, options, msg);
+}
+
+fn fakeHookStream(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    model: types.Model,
+    context: types.Context,
+    options: types.StreamOptions,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    _ = client;
+    _ = context;
+    try events.append(.{ .start = .{
+        .text = "",
+        .thinking = "",
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
     } });
+    try payload_hooks.dispatchRawJson(options, "{\"frame\":\"hook\"}");
+    try payload_hooks.appendTextDelta(allocator, events, options, 0, "hello");
+    try payload_hooks.dispatchUsage(options, .{ .input = 1, .output = 2, .total_tokens = 3 });
+    const msg: types.AssistantMessage = .{
+        .text = try allocator.dupe(u8, "hello"),
+        .thinking = "",
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+    };
+    try payload_hooks.appendDone(events, options, msg);
 }
 
 test "streamByProviderModelId dispatches registered provider" {
@@ -370,6 +419,21 @@ test "streamByProviderModelId dispatches registered provider" {
 
     try streamByProviderModelId(allocator, &client, &api_registry, &model_registry, "openai", "m", ctx, .{ .api_key = "x" }, &events);
     try std.testing.expect(events.items.len == 1);
+}
+
+test "resolveTransport prefers sse for current providers" {
+    const transport = try resolveTransport(.{
+        .api = "openai-completions",
+        .stream = fakeStream,
+    }, .auto);
+    try std.testing.expect(transport == .sse);
+}
+
+test "resolveTransport rejects unsupported websocket transport" {
+    try std.testing.expectError(error.UnsupportedTransport, resolveTransport(.{
+        .api = "openai-completions",
+        .stream = fakeStream,
+    }, .websocket));
 }
 
 test "streamSimpleByProviderModelId dispatches registered provider" {
@@ -443,6 +507,104 @@ test "streamSimpleByModel uses provider stream_simple when available" {
         .done => |done| try std.testing.expectEqualStrings("from-simple", done.text),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "streamByModel dispatches normalized payload hooks" {
+    const Capture = struct {
+        raw_json_count: usize = 0,
+        text_delta_count: usize = 0,
+        usage_count: usize = 0,
+        done_count: usize = 0,
+
+        fn handle(raw_ctx: ?*anyopaque, payload: types.ProviderPayload) !void {
+            const ctx_ptr = raw_ctx orelse return error.MissingContext;
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            switch (payload) {
+                .raw_json => ctx.raw_json_count += 1,
+                .text_delta => ctx.text_delta_count += 1,
+                .usage => ctx.usage_count += 1,
+                .done => ctx.done_count += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var api_registry = api_registry_mod.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try api_registry.register(.{ .api = "openai-completions", .stream = fakeHookStream });
+
+    const model: types.Model = .{
+        .id = "m_hook",
+        .name = "m_hook",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const ctx: types.Context = .{ .messages = &.{} };
+    var capture = Capture{};
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |*event| freeEventPayloads(allocator, event);
+        events.deinit();
+    }
+
+    try streamByModel(allocator, &client, &api_registry, model, ctx, .{
+        .api_key = "x",
+        .on_payload = Capture.handle,
+        .on_payload_ctx = &capture,
+    }, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), capture.raw_json_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.text_delta_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.usage_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.done_count);
+}
+
+test "streamByModel aborts when payload hook fails" {
+    const FailingCapture = struct {
+        fn handle(_: ?*anyopaque, payload: types.ProviderPayload) !void {
+            if (payload == .text_delta) return error.PayloadHookFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var api_registry = api_registry_mod.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try api_registry.register(.{ .api = "openai-completions", .stream = fakeHookStream });
+
+    const model: types.Model = .{
+        .id = "m_hook_fail",
+        .name = "m_hook_fail",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const ctx: types.Context = .{ .messages = &.{} };
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |*event| freeEventPayloads(allocator, event);
+        events.deinit();
+    }
+
+    try std.testing.expectError(error.PayloadHookFailed, streamByModel(allocator, &client, &api_registry, model, ctx, .{
+        .api_key = "x",
+        .on_payload = FailingCapture.handle,
+    }, &events));
 }
 
 test "completeByModel returns final assistant message" {

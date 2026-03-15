@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
+const payload_hooks = @import("../payload_hooks.zig");
 
 const MAX_RETRIES: usize = 3;
 const BASE_DELAY_MS: u64 = 1000;
@@ -129,6 +130,42 @@ fn extractCodexAccountId(allocator: std.mem.Allocator, api_key: []const u8) ![]c
 
 fn appendHeader(headers: *std.array_list.Managed(std.http.Header), name: []const u8, value: []const u8) !void {
     try headers.append(.{ .name = name, .value = value });
+}
+
+fn appendMetadataObject(
+    writer: anytype,
+    metadata: []const types.MetadataEntry,
+) !void {
+    try writer.writeAll(",\"metadata\":{");
+    for (metadata, 0..) |entry, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeJson(writer, entry.key);
+        try writer.writeByte(':');
+        try writeJson(writer, entry.value);
+    }
+    try writer.writeByte('}');
+}
+
+fn resolvedReasoningEffort(model: types.Model, options: types.StreamOptions) ?[]const u8 {
+    if (options.reasoning) |reasoning| return clampReasoningEffort(model.id, reasoning);
+    if (options.thinking_budget) |budget| {
+        if (budget.level) |level| return switch (level) {
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+        };
+    }
+    return null;
+}
+
+fn retryDelayMs(options: types.StreamOptions, attempt: usize) u64 {
+    const base_delay = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
+    if (options.max_retry_delay_ms) |cap_ms| {
+        return @min(base_delay, @as(u64, cap_ms));
+    }
+    return base_delay;
 }
 
 fn parseCodexError(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) ![]const u8 {
@@ -469,12 +506,15 @@ fn buildResponsesRequestBody(
         try body.writer().writeAll(",\"prompt_cache_key\":");
         try writeJson(body.writer(), session_id);
     }
-    if (options.reasoning) |reasoning| {
+    if (resolvedReasoningEffort(model, options)) |reasoning| {
         try body.writer().writeAll(",\"reasoning\":{\"effort\":");
-        try writeJson(body.writer(), clampReasoningEffort(model.id, reasoning));
+        try writeJson(body.writer(), reasoning);
         try body.writer().writeAll(",\"summary\":");
         try writeJson(body.writer(), options.reasoning_summary orelse "auto");
         try body.writer().writeAll("}");
+    }
+    if (options.metadata) |metadata| {
+        if (metadata.len > 0) try appendMetadataObject(body.writer(), metadata);
     }
     try body.writer().writeAll(",\"input\":[");
     var tool_call_ids = std.StringHashMap([]const u8).init(allocator);
@@ -627,7 +667,7 @@ fn streamOpenAIResponsesBase(
 
         req.sendBodyComplete(request_body) catch |err| {
             if (attempt < MAX_RETRIES) {
-                const delay_ms = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
+                const delay_ms = retryDelayMs(options, attempt);
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                 continue :attempt_loop;
             }
@@ -640,7 +680,7 @@ fn streamOpenAIResponsesBase(
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
             if (attempt < MAX_RETRIES) {
-                const delay_ms = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
+                const delay_ms = retryDelayMs(options, attempt);
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                 continue :attempt_loop;
             }
@@ -657,7 +697,7 @@ fn streamOpenAIResponsesBase(
             const err_reader = response.reader(&err_transfer);
             readAllResponseBody(allocator, err_reader, response.head.content_length, &err_buf) catch {
                 if (attempt < MAX_RETRIES and isRetryableError(response.head.status, "")) {
-                    const delay_ms = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
+                    const delay_ms = retryDelayMs(options, attempt);
                     std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                     continue :attempt_loop;
                 }
@@ -673,7 +713,7 @@ fn streamOpenAIResponsesBase(
             const friendly = try parseCodexError(allocator, response.head.status, err_buf.items);
             if (attempt < MAX_RETRIES and isRetryableError(response.head.status, friendly)) {
                 allocator.free(friendly);
-                const delay_ms = BASE_DELAY_MS * (@as(u64, 1) << @intCast(attempt));
+                const delay_ms = retryDelayMs(options, attempt);
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                 continue :attempt_loop;
             }
@@ -733,6 +773,7 @@ fn streamOpenAIResponsesBase(
                 const payload = std.mem.trim(u8, frame.items, " ");
                 frame.clearRetainingCapacity();
                 if (std.mem.eql(u8, payload, "[DONE]")) break;
+                try payload_hooks.dispatchRawJson(options, payload);
 
                 var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
                 defer parsed.deinit();
@@ -774,10 +815,7 @@ fn streamOpenAIResponsesBase(
                         if (delta_v != .string) continue;
                         try text_buf.appendSlice(delta_v.string);
                         try thinking.appendSlice(delta_v.string);
-                        try events.append(.{ .thinking_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, delta_v.string),
-                        } });
+                        try payload_hooks.appendThinkingDelta(allocator, events, options, current_index, delta_v.string);
                     }
                 } else if (std.mem.eql(u8, t.string, "response.output_text.delta") or std.mem.eql(u8, t.string, "response.refusal.delta")) {
                     if (current_kind == .text) {
@@ -785,20 +823,14 @@ fn streamOpenAIResponsesBase(
                         if (delta_v != .string) continue;
                         try text_buf.appendSlice(delta_v.string);
                         try full_text.appendSlice(delta_v.string);
-                        try events.append(.{ .text_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, delta_v.string),
-                        } });
+                        try payload_hooks.appendTextDelta(allocator, events, options, current_index, delta_v.string);
                     }
                 } else if (std.mem.eql(u8, t.string, "response.function_call_arguments.delta")) {
                     if (current_kind == .tool) {
                         const delta_v = root.object.get("delta") orelse continue;
                         if (delta_v != .string) continue;
                         try current_tool.args.appendSlice(delta_v.string);
-                        try events.append(.{ .toolcall_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, delta_v.string),
-                        } });
+                        try payload_hooks.appendToolCallDelta(allocator, events, options, current_index, delta_v.string);
                     }
                 } else if (std.mem.eql(u8, t.string, "response.function_call_arguments.done")) {
                     if (current_kind == .tool) {
@@ -830,6 +862,7 @@ fn streamOpenAIResponsesBase(
                                         if (v == .integer) usage.total_tokens = @intCast(v.integer);
                                     }
                                     types.calculateCost(model, &usage);
+                                    try payload_hooks.dispatchUsage(options, usage);
                                 }
                             }
                         }
@@ -886,7 +919,7 @@ fn streamOpenAIResponsesBase(
         out.tool_calls = try tool_calls.toOwnedSlice();
         out.usage = usage;
         out.stop_reason = if (out.tool_calls.len > 0 and stop_reason == .stop) .tool_use else stop_reason;
-        try events.append(.{ .done = out });
+        try payload_hooks.appendDone(events, options, out);
         return;
     }
 }
@@ -1047,4 +1080,36 @@ test "codex responses request uses instructions and omits developer role" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"sys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") == null);
+}
+
+test "openai responses request includes metadata only when provided" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1_000_000,
+        .max_tokens = 1,
+    };
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+    const metadata = [_]types.MetadataEntry{
+        .{ .key = "trace_id", .value = "abc123" },
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{ .metadata = &metadata },
+        "https://api.openai.com/v1/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\":{\"trace_id\":\"abc123\"}") != null);
 }

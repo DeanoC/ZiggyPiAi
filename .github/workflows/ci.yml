@@ -1,4 +1,4 @@
-name: ci
+name: zig-tests
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   zig-tests:
-    uses: DeanoC/ZiggySpiderweb/.github/workflows/ziggy-shared-ci.yml@main
+    uses: DeanoC/Spiderweb/.github/workflows/ziggy-shared-ci.yml@main
     with:
       build_command: zig build
       test_command: zig build test

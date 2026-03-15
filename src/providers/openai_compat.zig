@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
+const payload_hooks = @import("../payload_hooks.zig");
 
 fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
@@ -288,6 +289,7 @@ fn parseSSEFrames(
     allocator: std.mem.Allocator,
     payload: []const u8,
     model: types.Model,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     var text_builder = std.array_list.Managed(u8).init(allocator);
@@ -338,6 +340,7 @@ fn parseSSEFrames(
             const frame = std.mem.trim(u8, frame_data.items, " ");
             frame_data.clearRetainingCapacity();
             if (std.mem.eql(u8, frame, "[DONE]")) break;
+            try payload_hooks.dispatchRawJson(options, frame);
 
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, frame, .{}) catch continue;
             defer parsed.deinit();
@@ -356,6 +359,7 @@ fn parseSSEFrames(
                         if (v == .integer) usage.total_tokens = @intCast(v.integer);
                     }
                     types.calculateCost(model, &usage);
+                    try payload_hooks.dispatchUsage(options, usage);
                 }
             }
 
@@ -384,12 +388,7 @@ fn parseSSEFrames(
                     }
                     try appendList(&text_builder, content_v.string);
                     try appendList(&full_text_builder, content_v.string);
-                    try events.append(.{
-                        .text_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, content_v.string),
-                        },
-                    });
+                    try payload_hooks.appendTextDelta(allocator, events, options, current_index, content_v.string);
                 }
             }
 
@@ -406,12 +405,7 @@ fn parseSSEFrames(
                     }
                     try appendList(&text_builder, think_v.string);
                     try appendList(&thinking_builder, think_v.string);
-                    try events.append(.{
-                        .thinking_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, think_v.string),
-                        },
-                    });
+                    try payload_hooks.appendThinkingDelta(allocator, events, options, current_index, think_v.string);
                 }
             } else if (delta_v.object.get("reasoning")) |think_v| {
                 if (think_v == .string and think_v.string.len > 0) {
@@ -426,12 +420,7 @@ fn parseSSEFrames(
                     }
                     try appendList(&text_builder, think_v.string);
                     try appendList(&thinking_builder, think_v.string);
-                    try events.append(.{
-                        .thinking_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, think_v.string),
-                        },
-                    });
+                    try payload_hooks.appendThinkingDelta(allocator, events, options, current_index, think_v.string);
                 }
             } else if (delta_v.object.get("reasoning_text")) |think_v| {
                 if (think_v == .string and think_v.string.len > 0) {
@@ -446,12 +435,7 @@ fn parseSSEFrames(
                     }
                     try appendList(&text_builder, think_v.string);
                     try appendList(&thinking_builder, think_v.string);
-                    try events.append(.{
-                        .thinking_delta = .{
-                            .content_index = current_index,
-                            .delta = try allocator.dupe(u8, think_v.string),
-                        },
-                    });
+                    try payload_hooks.appendThinkingDelta(allocator, events, options, current_index, think_v.string);
                 }
             }
 
@@ -504,12 +488,7 @@ fn parseSSEFrames(
                         if (tc_args_delta.len > 0) {
                             try current_tool.partial_args.appendSlice(tc_args_delta);
                         }
-                        try events.append(.{
-                            .toolcall_delta = .{
-                                .content_index = current_index,
-                                .delta = try allocator.dupe(u8, tc_args_delta),
-                            },
-                        });
+                        try payload_hooks.appendToolCallDelta(allocator, events, options, current_index, tc_args_delta);
                     }
                 }
             }
@@ -531,7 +510,7 @@ fn parseSSEFrames(
     out_msg.tool_calls = try tool_calls.toOwnedSlice();
     out_msg.usage = usage;
     out_msg.stop_reason = stop_reason;
-    try events.append(.{ .done = out_msg });
+    try payload_hooks.appendDone(events, options, out_msg);
 }
 
 pub fn streamOpenAICompat(
@@ -640,11 +619,18 @@ pub fn streamOpenAICompat(
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
+    var request_headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer request_headers.deinit();
+    try request_headers.append(.{ .name = "content-type", .value = "application/json" });
+    try request_headers.append(.{ .name = "accept", .value = "text/event-stream" });
+    if (options.headers) |custom_headers| {
+        for (custom_headers) |header| {
+            try request_headers.append(.{ .name = header.name, .value = header.value });
+        }
+    }
+
     var req = try client.request(.POST, try std.Uri.parse(endpoint), .{
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "accept", .value = "text/event-stream" },
-        },
+        .extra_headers = request_headers.items,
         .headers = .{
             .authorization = .{ .override = auth_header },
         },
@@ -670,7 +656,7 @@ pub fn streamOpenAICompat(
     var transfer_buffer: [8192]u8 = undefined;
     const response_reader = response.reader(&transfer_buffer);
     try readAllResponseBody(response_reader, &response_buf);
-    try parseSSEFrames(allocator, response_buf.items, model, events);
+    try parseSSEFrames(allocator, response_buf.items, model, options, events);
 }
 
 fn freeTestEvents(allocator: std.mem.Allocator, events: *std.array_list.Managed(types.AssistantMessageEvent)) void {
@@ -719,7 +705,7 @@ test "parseSSEFrames emits text and toolcall events" {
 
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
     defer freeTestEvents(allocator, &events);
-    try parseSSEFrames(allocator, sse, model, &events);
+    try parseSSEFrames(allocator, sse, model, .{}, &events);
     try std.testing.expect(events.items.len >= 7);
 }
 
@@ -792,7 +778,7 @@ test "parseSSEFrames handles interleaved thinking and text deltas" {
 
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
     defer freeTestEvents(allocator, &events);
-    try parseSSEFrames(allocator, sse, model, &events);
+    try parseSSEFrames(allocator, sse, model, .{}, &events);
 
     var saw_thinking = false;
     var saw_text = false;
@@ -831,7 +817,7 @@ test "parseSSEFrames handles empty stream payload" {
 
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
     defer freeTestEvents(allocator, &events);
-    try parseSSEFrames(allocator, sse, model, &events);
+    try parseSSEFrames(allocator, sse, model, .{}, &events);
     try std.testing.expect(events.items.len == 2);
     switch (events.items[1]) {
         .done => |done| {
@@ -861,7 +847,7 @@ test "parseSSEFrames preserves unicode content" {
 
     var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
     defer freeTestEvents(allocator, &events);
-    try parseSSEFrames(allocator, sse, model, &events);
+    try parseSSEFrames(allocator, sse, model, .{}, &events);
 
     switch (events.items[1]) {
         .text_start => {},

@@ -8,28 +8,15 @@ const openai = @import("openai_compat.zig");
 const codex = @import("openai_codex_responses.zig");
 const openai_responses = @import("openai_responses.zig");
 
-fn asStreamOptions(options: types.SimpleStreamOptions) types.StreamOptions {
-    return .{
-        .temperature = options.temperature,
-        .max_tokens = options.max_tokens,
-        .api_key = options.api_key,
-        .reasoning = options.reasoning,
-        .reasoning_summary = options.reasoning_summary,
-        .session_id = options.session_id,
-        .text_verbosity = options.text_verbosity,
-        .headers = options.headers,
-    };
-}
-
 fn streamSimpleOpenAICompat(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try openai.streamOpenAICompat(allocator, client, model, context, asStreamOptions(options), events);
+    try openai.streamOpenAICompat(allocator, client, model, context, options, events);
 }
 
 fn streamSimpleOpenAIResponses(
@@ -37,10 +24,10 @@ fn streamSimpleOpenAIResponses(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try openai_responses.streamOpenAIResponses(allocator, client, model, context, asStreamOptions(options), events);
+    try openai_responses.streamOpenAIResponses(allocator, client, model, context, options, events);
 }
 
 fn streamSimpleOpenAICodexResponses(
@@ -48,10 +35,10 @@ fn streamSimpleOpenAICodexResponses(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try codex.streamOpenAICodexResponses(allocator, client, model, context, asStreamOptions(options), events);
+    try codex.streamOpenAICodexResponses(allocator, client, model, context, options, events);
 }
 
 fn streamSimpleAnthropicMessages(
@@ -59,10 +46,10 @@ fn streamSimpleAnthropicMessages(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try anthropic.streamAnthropicMessages(allocator, client, model, context, asStreamOptions(options), events);
+    try anthropic.streamAnthropicMessages(allocator, client, model, context, options, events);
 }
 
 fn streamSimpleGoogleGenerativeAI(
@@ -70,10 +57,10 @@ fn streamSimpleGoogleGenerativeAI(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try google.streamGoogleGenerativeAI(allocator, client, model, context, asStreamOptions(options), events);
+    try google.streamGoogleGenerativeAI(allocator, client, model, context, options, events);
 }
 
 fn streamSimpleBedrockConverseStream(
@@ -81,10 +68,10 @@ fn streamSimpleBedrockConverseStream(
     client: *std.http.Client,
     model: types.Model,
     context: types.Context,
-    options: types.SimpleStreamOptions,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    try bedrock.streamBedrockConverseStream(allocator, client, model, context, asStreamOptions(options), events);
+    try bedrock.streamBedrockConverseStream(allocator, client, model, context, options, events);
 }
 
 pub fn registerBuiltInApiProviders(api_registry: *registry.ApiRegistry) !void {
@@ -92,46 +79,64 @@ pub fn registerBuiltInApiProviders(api_registry: *registry.ApiRegistry) !void {
         .api = "openai-completions",
         .stream = openai.streamOpenAICompat,
         .stream_simple = streamSimpleOpenAICompat,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "openai-responses",
         .stream = openai_responses.streamOpenAIResponses,
         .stream_simple = streamSimpleOpenAIResponses,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "azure-openai-responses",
         .stream = openai_responses.streamOpenAIResponses,
         .stream_simple = streamSimpleOpenAIResponses,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "openai-codex-responses",
         .stream = codex.streamOpenAICodexResponses,
         .stream_simple = streamSimpleOpenAICodexResponses,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "anthropic-messages",
         .stream = anthropic.streamAnthropicMessages,
         .stream_simple = streamSimpleAnthropicMessages,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "google-generative-ai",
         .stream = google.streamGoogleGenerativeAI,
         .stream_simple = streamSimpleGoogleGenerativeAI,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "google-gemini-cli",
         .stream = google.streamGoogleGenerativeAI,
         .stream_simple = streamSimpleGoogleGenerativeAI,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "google-vertex",
         .stream = google.streamGoogleGenerativeAI,
         .stream_simple = streamSimpleGoogleGenerativeAI,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
     try api_registry.register(.{
         .api = "bedrock-converse-stream",
         .stream = bedrock.streamBedrockConverseStream,
         .stream_simple = streamSimpleBedrockConverseStream,
+        .supports_sse = true,
+        .supports_websocket = false,
     });
 }
 
