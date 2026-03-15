@@ -74,6 +74,51 @@ pub fn appendDone(
     options: types.StreamOptions,
     message: types.AssistantMessage,
 ) !void {
-    try dispatchDone(options);
     try events.append(.{ .done = message });
+    try dispatchDone(options);
+}
+
+fn freeTestEventPayloads(allocator: std.mem.Allocator, events: *std.array_list.Managed(types.AssistantMessageEvent)) void {
+    for (events.items) |*event| {
+        switch (event.*) {
+            .done => |*done| {
+                allocator.free(done.text);
+                allocator.free(done.thinking);
+                if (done.error_message) |err| allocator.free(err);
+                if (done.tool_calls.len > 0) allocator.free(done.tool_calls);
+            },
+            else => {},
+        }
+    }
+    events.deinit();
+}
+
+test "appendDone records done event before invoking callback" {
+    const Capture = struct {
+        fn failOnDone(_: ?*anyopaque, payload: types.ProviderPayload) !void {
+            if (payload == .done) return error.DoneHookFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer freeTestEventPayloads(allocator, &events);
+
+    const message: types.AssistantMessage = .{
+        .text = try allocator.dupe(u8, "done"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = "api",
+        .provider = "provider",
+        .model = "model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    };
+
+    try std.testing.expectError(error.DoneHookFailed, appendDone(&events, .{
+        .on_payload = Capture.failOnDone,
+    }, message));
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0] == .done);
 }
