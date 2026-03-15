@@ -5,6 +5,7 @@ const payload_hooks = @import("../payload_hooks.zig");
 
 const service_name = "bedrock";
 const authenticated_placeholder = "<authenticated>";
+const redacted_reasoning_placeholder = "[Reasoning redacted]";
 
 fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
@@ -514,6 +515,56 @@ fn appendAssistantToolCalls(allocator: std.mem.Allocator, writer: anytype, msg: 
     return true;
 }
 
+fn hasAssistantMessageContent(msg: types.Message) bool {
+    if (msg.content_blocks) |blocks| {
+        for (blocks) |block| {
+            switch (block) {
+                .text => |value| if (value.text.len > 0) return true,
+                .thinking => |value| {
+                    if (value.thinking.len > 0 or value.signature != null or value.redacted) return true;
+                },
+                .image => {},
+            }
+        }
+        return false;
+    }
+    return msg.content.len > 0;
+}
+
+fn appendBedrockAssistantThinkingBlock(
+    writer: anytype,
+    block: types.ThinkingContent,
+) !bool {
+    if (block.redacted) {
+        if (block.signature) |signature| {
+            try writer.writeAll("{\"reasoningContent\":{\"redactedContent\":");
+            try writeJson(writer, signature);
+            try writer.writeAll("}}");
+            return true;
+        }
+        if (block.thinking.len == 0) return false;
+        try writer.writeAll("{\"text\":");
+        try writeJson(writer, block.thinking);
+        try writer.writeAll("}");
+        return true;
+    }
+
+    if (block.thinking.len == 0) return false;
+    if (block.signature) |signature| {
+        try writer.writeAll("{\"reasoningContent\":{\"reasoningText\":{\"text\":");
+        try writeJson(writer, block.thinking);
+        try writer.writeAll(",\"signature\":");
+        try writeJson(writer, signature);
+        try writer.writeAll("}}}");
+        return true;
+    }
+
+    try writer.writeAll("{\"text\":");
+    try writeJson(writer, block.thinking);
+    try writer.writeAll("}");
+    return true;
+}
+
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "opus-4-6") != null or std.mem.indexOf(u8, model_id, "opus-4.6") != null;
 }
@@ -878,12 +929,15 @@ fn buildConverseBody(
             continue;
         }
 
-        var text_preview = std.array_list.Managed(u8).init(allocator);
-        defer text_preview.deinit();
-        try transform.appendMessageTextToWriter(msg, text_preview.writer());
-        const has_non_empty_text = text_preview.items.len > 0;
         const has_tool_calls = msg.role == .assistant and msg.tool_calls != null and msg.tool_calls.?.len > 0;
-        if (!has_non_empty_text and !has_tool_calls) continue;
+        if (msg.role == .assistant) {
+            if (!hasAssistantMessageContent(msg) and !has_tool_calls) continue;
+        } else {
+            var text_preview = std.array_list.Managed(u8).init(allocator);
+            defer text_preview.deinit();
+            try transform.appendMessageTextToWriter(msg, text_preview.writer());
+            if (text_preview.items.len == 0) continue;
+        }
 
         if (!first_message) try body.writer().writeByte(',');
         first_message = false;
@@ -894,15 +948,50 @@ fn buildConverseBody(
 
         var wrote_any = false;
         if (msg.role == .assistant) {
-            wrote_any = try appendAssistantToolCalls(allocator, body.writer(), msg);
-            if (wrote_any) try body.writer().writeByte(',');
-        }
+            if (msg.content_blocks) |blocks| {
+                for (blocks) |block| {
+                    const wrote_block = switch (block) {
+                        .text => |value| blk: {
+                            if (value.text.len == 0) break :blk false;
+                            if (wrote_any) try body.writer().writeByte(',');
+                            try body.writer().writeAll("{\"text\":");
+                            try writeJson(body.writer(), value.text);
+                            try body.writer().writeAll("}");
+                            break :blk true;
+                        },
+                        .thinking => |value| blk: {
+                            const can_write = value.redacted or value.signature != null or value.thinking.len > 0;
+                            if (!can_write) break :blk false;
+                            if (wrote_any) try body.writer().writeByte(',');
+                            if (!try appendBedrockAssistantThinkingBlock(body.writer(), value)) break :blk false;
+                            break :blk true;
+                        },
+                        .image => false,
+                    };
+                    if (wrote_block) wrote_any = true;
+                }
+            } else if (msg.content.len > 0) {
+                try body.writer().writeAll("{\"text\":");
+                try writeJson(body.writer(), msg.content);
+                try body.writer().writeAll("}");
+                wrote_any = true;
+            }
 
-        try body.writer().writeAll("{\"text\":");
-        if (!has_non_empty_text) {
-            try writeJson(body.writer(), "");
+            if (has_tool_calls) {
+                if (wrote_any) try body.writer().writeByte(',');
+                wrote_any = try appendAssistantToolCalls(allocator, body.writer(), msg) or wrote_any;
+            }
+
+            if (!wrote_any) {
+                try body.writer().writeAll("{\"text\":\"\"}");
+            }
         } else {
+            var text_preview = std.array_list.Managed(u8).init(allocator);
+            defer text_preview.deinit();
+            try transform.appendMessageTextToWriter(msg, text_preview.writer());
+            try body.writer().writeAll("{\"text\":");
             try writeJson(body.writer(), text_preview.items);
+            try body.writer().writeAll("}");
         }
         try body.writer().writeAll("}]}");
     }
@@ -970,6 +1059,7 @@ fn appendTextEvent(
     text: []const u8,
     block_index: usize,
     full_text: *std.array_list.Managed(u8),
+    content_blocks: *std.array_list.Managed(types.MessageContent),
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
@@ -978,21 +1068,33 @@ fn appendTextEvent(
     try full_text.appendSlice(text);
     try payload_hooks.appendTextDelta(allocator, events, options, block_index, text);
     try events.append(.{ .text_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, text) } });
+    try content_blocks.append(.{ .text = .{
+        .text = try allocator.dupe(u8, text),
+    } });
 }
 
 fn appendThinkingEvent(
     allocator: std.mem.Allocator,
-    text: []const u8,
+    block: types.ThinkingContent,
     block_index: usize,
     full_thinking: *std.array_list.Managed(u8),
+    content_blocks: *std.array_list.Managed(types.MessageContent),
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    if (text.len == 0) return;
+    if (block.thinking.len == 0 and block.signature == null and !block.redacted) return;
     try events.append(.{ .thinking_start = block_index });
-    try full_thinking.appendSlice(text);
-    try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, text);
-    try events.append(.{ .thinking_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, text) } });
+    if (block.thinking.len > 0) {
+        try full_thinking.appendSlice(block.thinking);
+        try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, block.thinking);
+    }
+    try events.append(.{ .thinking_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, block.thinking) } });
+    try content_blocks.append(.{ .thinking = .{
+        .thinking = try allocator.dupe(u8, block.thinking),
+        .signature = if (block.signature) |signature| try allocator.dupe(u8, signature) else null,
+        .redacted = block.redacted,
+        .continuation_token = if (block.continuation_token) |token| try allocator.dupe(u8, token) else null,
+    } });
 }
 
 const EventBlockKind = enum { text, thinking, tool };
@@ -1003,6 +1105,9 @@ const EventBlockState = struct {
     text: std.array_list.Managed(u8),
     tool_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
+    signature: ?[]const u8 = null,
+    redacted: bool = false,
+    continuation_token: ?[]const u8 = null,
 
     fn init(allocator: std.mem.Allocator, kind: EventBlockKind, content_index: usize) EventBlockState {
         return .{
@@ -1016,6 +1121,8 @@ const EventBlockState = struct {
         self.text.deinit();
         if (self.tool_id) |v| allocator.free(v);
         if (self.tool_name) |v| allocator.free(v);
+        if (self.signature) |v| allocator.free(v);
+        if (self.continuation_token) |v| allocator.free(v);
     }
 };
 
@@ -1057,6 +1164,15 @@ fn parseEventPayload(allocator: std.mem.Allocator, payload: []const u8) !?std.js
     return std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch null;
 }
 
+fn replaceOwnedOptionalString(
+    allocator: std.mem.Allocator,
+    target: *?[]const u8,
+    value: []const u8,
+) !void {
+    if (target.*) |existing| allocator.free(existing);
+    target.* = if (value.len > 0) try allocator.dupe(u8, value) else null;
+}
+
 fn exceptionPrefixForEventType(event_type: []const u8) []const u8 {
     if (std.mem.eql(u8, event_type, "internalServerException")) return "Internal server error";
     if (std.mem.eql(u8, event_type, "modelStreamErrorException")) return "Model stream error";
@@ -1078,6 +1194,7 @@ fn parseConverseEventStreamResponse(
     var out = types.AssistantMessage{
         .text = "",
         .thinking = "",
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = model.api,
         .provider = model.provider,
@@ -1092,6 +1209,24 @@ fn parseConverseEventStreamResponse(
     defer full_text.deinit();
     var full_thinking = std.array_list.Managed(u8).init(allocator);
     defer full_thinking.deinit();
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
     var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
     defer tool_calls.deinit();
 
@@ -1252,22 +1387,40 @@ fn parseConverseEventStreamResponse(
                     }
                 } else if (delta_v.object.get("reasoningContent")) |reasoning_v| {
                     if (reasoning_v == .object) {
-                        if (reasoning_v.object.get("text")) |text_v| {
-                            if (text_v == .string and text_v.string.len > 0) {
-                                var state = blocks.get(block_index);
-                                if (state == null) {
-                                    const created = try allocator.create(EventBlockState);
-                                    created.* = EventBlockState.init(allocator, .thinking, next_content_index);
-                                    try blocks.put(block_index, created);
-                                    try events.append(.{ .thinking_start = next_content_index });
-                                    state = created;
-                                    next_content_index += 1;
-                                }
-                                if (state.?.kind == .thinking) {
+                        var state = blocks.get(block_index);
+                        if (state == null) {
+                            const created = try allocator.create(EventBlockState);
+                            created.* = EventBlockState.init(allocator, .thinking, next_content_index);
+                            try blocks.put(block_index, created);
+                            try events.append(.{ .thinking_start = next_content_index });
+                            state = created;
+                            next_content_index += 1;
+                        }
+                        if (state.?.kind == .thinking) {
+                            if (reasoning_v.object.get("text")) |text_v| {
+                                if (text_v == .string and text_v.string.len > 0) {
                                     try state.?.text.appendSlice(text_v.string);
                                     try full_thinking.appendSlice(text_v.string);
                                     try payload_hooks.appendThinkingDelta(allocator, events, options, state.?.content_index, text_v.string);
                                 }
+                            }
+                            if (reasoning_v.object.get("signature")) |signature_v| {
+                                if (signature_v == .string and signature_v.string.len > 0) {
+                                    try replaceOwnedOptionalString(allocator, &state.?.signature, signature_v.string);
+                                }
+                            }
+                            if (reasoning_v.object.get("redactedContent")) |redacted_v| {
+                                const redacted_payload = switch (redacted_v) {
+                                    .string => try allocator.dupe(u8, redacted_v.string),
+                                    else => try std.json.Stringify.valueAlloc(allocator, redacted_v, .{}),
+                                };
+                                defer allocator.free(redacted_payload);
+                                state.?.redacted = true;
+                                if (state.?.text.items.len == 0) {
+                                    try state.?.text.appendSlice(redacted_reasoning_placeholder);
+                                    try full_thinking.appendSlice(redacted_reasoning_placeholder);
+                                }
+                                try replaceOwnedOptionalString(allocator, &state.?.signature, redacted_payload);
                             }
                         }
                     }
@@ -1308,14 +1461,31 @@ fn parseConverseEventStreamResponse(
                         allocator.destroy(state);
                     }
                     switch (state.kind) {
-                        .text => try events.append(.{ .text_end = .{
-                            .content_index = state.content_index,
-                            .content = try allocator.dupe(u8, state.text.items),
-                        } }),
-                        .thinking => try events.append(.{ .thinking_end = .{
-                            .content_index = state.content_index,
-                            .content = try allocator.dupe(u8, state.text.items),
-                        } }),
+                        .text => {
+                            try events.append(.{ .text_end = .{
+                                .content_index = state.content_index,
+                                .content = try allocator.dupe(u8, state.text.items),
+                            } });
+                            if (state.text.items.len > 0) {
+                                try content_blocks.append(.{ .text = .{
+                                    .text = try allocator.dupe(u8, state.text.items),
+                                } });
+                            }
+                        },
+                        .thinking => {
+                            try events.append(.{ .thinking_end = .{
+                                .content_index = state.content_index,
+                                .content = try allocator.dupe(u8, state.text.items),
+                            } });
+                            if (state.text.items.len > 0 or state.signature != null or state.redacted) {
+                                try content_blocks.append(.{ .thinking = .{
+                                    .thinking = try allocator.dupe(u8, state.text.items),
+                                    .signature = if (state.signature) |signature| try allocator.dupe(u8, signature) else null,
+                                    .redacted = state.redacted,
+                                    .continuation_token = if (state.continuation_token) |token| try allocator.dupe(u8, token) else null,
+                                } });
+                            }
+                        },
                         .tool => {
                             const args_json = if (state.text.items.len == 0)
                                 try allocator.dupe(u8, "{}")
@@ -1389,6 +1559,7 @@ fn parseConverseEventStreamResponse(
     }
     out.text = try allocator.dupe(u8, full_text.items);
     out.thinking = try allocator.dupe(u8, full_thinking.items);
+    out.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = stop_reason;
@@ -1420,6 +1591,7 @@ fn parseConverseResponse(
     var out = types.AssistantMessage{
         .text = "",
         .thinking = "",
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = model.api,
         .provider = model.provider,
@@ -1458,6 +1630,24 @@ fn parseConverseResponse(
     defer full_text.deinit();
     var full_thinking = std.array_list.Managed(u8).init(allocator);
     defer full_thinking.deinit();
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
     var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
     defer tool_calls.deinit();
 
@@ -1473,7 +1663,7 @@ fn parseConverseResponse(
 
                                 if (item.object.get("text")) |text_v| {
                                     if (text_v == .string) {
-                                        try appendTextEvent(allocator, text_v.string, block_index, &full_text, options, events);
+                                        try appendTextEvent(allocator, text_v.string, block_index, &full_text, &content_blocks, options, events);
                                         block_index += 1;
                                     }
                                 }
@@ -1484,11 +1674,29 @@ fn parseConverseResponse(
                                             if (rt_v == .object) {
                                                 if (rt_v.object.get("text")) |t_v| {
                                                     if (t_v == .string) {
-                                                        try appendThinkingEvent(allocator, t_v.string, block_index, &full_thinking, options, events);
+                                                        try appendThinkingEvent(allocator, .{
+                                                            .thinking = t_v.string,
+                                                            .signature = if (rt_v.object.get("signature")) |signature_v|
+                                                                if (signature_v == .string) signature_v.string else null
+                                                            else
+                                                                null,
+                                                        }, block_index, &full_thinking, &content_blocks, options, events);
                                                         block_index += 1;
                                                     }
                                                 }
                                             }
+                                        } else if (reasoning_v.object.get("redactedContent")) |redacted_v| {
+                                            const redacted_payload = switch (redacted_v) {
+                                                .string => try allocator.dupe(u8, redacted_v.string),
+                                                else => try std.json.Stringify.valueAlloc(allocator, redacted_v, .{}),
+                                            };
+                                            defer allocator.free(redacted_payload);
+                                            try appendThinkingEvent(allocator, .{
+                                                .thinking = redacted_reasoning_placeholder,
+                                                .signature = redacted_payload,
+                                                .redacted = true,
+                                            }, block_index, &full_thinking, &content_blocks, options, events);
+                                            block_index += 1;
                                         }
                                     }
                                 }
@@ -1534,6 +1742,7 @@ fn parseConverseResponse(
 
     out.text = try allocator.dupe(u8, full_text.items);
     out.thinking = try allocator.dupe(u8, full_thinking.items);
+    out.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = stop_reason;
@@ -1823,6 +2032,48 @@ test "bedrock request body includes tool choice and request metadata" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"toolChoice\":{\"tool\":{\"name\":\"sum\"}}") != null);
 }
 
+test "bedrock request body replays reasoning content blocks" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-sonnet-4-20250514-v1:0",
+        .name = "Claude Sonnet 4",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+    const blocks = [_]types.MessageContent{
+        .{ .thinking = .{
+            .thinking = "chain of thought",
+            .signature = "sig-456",
+        } },
+        .{ .thinking = .{
+            .thinking = redacted_reasoning_placeholder,
+            .signature = "opaque-redacted",
+            .redacted = true,
+        } },
+        .{ .text = .{ .text = "hello" } },
+    };
+    const context: types.Context = .{
+        .messages = &.{
+            .{
+                .role = .assistant,
+                .content_blocks = &blocks,
+            },
+        },
+    };
+
+    const body = try buildConverseBody(allocator, model, context, .{});
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoningContent\":{\"reasoningText\":{\"text\":\"chain of thought\",\"signature\":\"sig-456\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoningContent\":{\"redactedContent\":\"opaque-redacted\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"hello\"") != null);
+}
+
 test "bedrock request body uses explicit reasoning effort overrides" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
@@ -1966,6 +2217,7 @@ test "bedrock response parser emits text and tool events" {
                 .done => |v| {
                     allocator.free(v.text);
                     allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                     for (v.tool_calls) |tc| {
                         allocator.free(tc.id);
                         allocator.free(tc.name);
@@ -1982,6 +2234,73 @@ test "bedrock response parser emits text and tool events" {
 
     try parseConverseResponse(allocator, payload, model, .{}, &events);
     try std.testing.expect(events.items.len >= 5);
+}
+
+test "bedrock response parser preserves reasoning signatures and redactions" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const payload =
+        "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[" ++
+        "{\"reasoningContent\":{\"reasoningText\":{\"text\":\"thinking\",\"signature\":\"sig-1\"}}}," ++
+        "{\"reasoningContent\":{\"redactedContent\":\"opaque-redacted\"}}" ++
+        "]}}}";
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |v| allocator.free(v.delta),
+                .text_end => |v| allocator.free(v.content),
+                .thinking_delta => |v| allocator.free(v.delta),
+                .thinking_end => |v| allocator.free(v.content),
+                .toolcall_delta => |v| allocator.free(v.delta),
+                .toolcall_end => |v| {
+                    allocator.free(v.tool_call.id);
+                    allocator.free(v.tool_call.name);
+                    allocator.free(v.tool_call.arguments_json);
+                },
+                .done => |v| {
+                    allocator.free(v.text);
+                    allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks_inner| types.freeMessageContents(allocator, blocks_inner);
+                    for (v.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    if (v.tool_calls.len > 0) allocator.free(v.tool_calls);
+                },
+                .err => |v| allocator.free(v),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseConverseResponse(allocator, payload, model, .{}, &events);
+    switch (events.items[events.items.len - 1]) {
+        .done => |msg| {
+            try std.testing.expect(msg.content_blocks != null);
+            try std.testing.expectEqual(@as(usize, 2), msg.content_blocks.?.len);
+            try std.testing.expect(msg.content_blocks.?[0] == .thinking);
+            try std.testing.expectEqualStrings("thinking", msg.content_blocks.?[0].thinking.thinking);
+            try std.testing.expectEqualStrings("sig-1", msg.content_blocks.?[0].thinking.signature.?);
+            try std.testing.expect(msg.content_blocks.?[1].thinking.redacted);
+            try std.testing.expectEqualStrings("opaque-redacted", msg.content_blocks.?[1].thinking.signature.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "bedrock region derivation from base url" {
@@ -2184,6 +2503,7 @@ test "bedrock eventstream parser emits streaming events" {
                 .done => |v| {
                     allocator.free(v.text);
                     allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                     for (v.tool_calls) |tc| {
                         allocator.free(tc.id);
                         allocator.free(tc.name);
@@ -2250,6 +2570,7 @@ test "bedrock eventstream parser maps exception events to descriptive errors" {
                 .done => |v| {
                     allocator.free(v.text);
                     allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                     for (v.tool_calls) |tc| {
                         allocator.free(tc.id);
                         allocator.free(tc.name);
@@ -2307,6 +2628,7 @@ test "bedrock converse response fallback parses regular json bodies" {
                 .done => |v| {
                     allocator.free(v.text);
                     allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                     for (v.tool_calls) |tc| {
                         allocator.free(tc.id);
                         allocator.free(tc.name);
@@ -2385,6 +2707,7 @@ test "bedrock converse fallback preserves payload hook failures" {
                 .done => |v| {
                     allocator.free(v.text);
                     allocator.free(v.thinking);
+                    if (v.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                     for (v.tool_calls) |tc| {
                         allocator.free(tc.id);
                         allocator.free(tc.name);

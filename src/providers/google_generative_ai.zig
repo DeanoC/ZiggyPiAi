@@ -814,11 +814,77 @@ fn parseGoogleSseResponse(
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
+    const CurrentBlockKind = enum { none, text, thinking };
+
+    const CurrentBlock = struct {
+        kind: CurrentBlockKind = .none,
+        content_index: usize = 0,
+    };
+
+    const Helpers = struct {
+        fn resetCurrentSignature(allocator_inner: std.mem.Allocator, signature: *?[]const u8) void {
+            if (signature.*) |value| allocator_inner.free(value);
+            signature.* = null;
+        }
+
+        fn updateCurrentSignature(
+            allocator_inner: std.mem.Allocator,
+            signature: *?[]const u8,
+            value: []const u8,
+        ) !void {
+            if (value.len == 0) return;
+            resetCurrentSignature(allocator_inner, signature);
+            signature.* = try allocator_inner.dupe(u8, value);
+        }
+
+        fn finishCurrentBlock(
+            allocator_inner: std.mem.Allocator,
+            current: *CurrentBlock,
+            text: *std.array_list.Managed(u8),
+            signature: *?[]const u8,
+            content_blocks: *std.array_list.Managed(types.MessageContent),
+            events_inner: *std.array_list.Managed(types.AssistantMessageEvent),
+        ) !void {
+            switch (current.kind) {
+                .none => {},
+                .text => {
+                    try events_inner.append(.{ .text_end = .{
+                        .content_index = current.content_index,
+                        .content = try allocator_inner.dupe(u8, text.items),
+                    } });
+                    if (text.items.len > 0) {
+                        try content_blocks.append(.{ .text = .{
+                            .text = try allocator_inner.dupe(u8, text.items),
+                        } });
+                    }
+                },
+                .thinking => {
+                    try events_inner.append(.{ .thinking_end = .{
+                        .content_index = current.content_index,
+                        .content = try allocator_inner.dupe(u8, text.items),
+                    } });
+                    if (text.items.len > 0 or signature.* != null) {
+                        try content_blocks.append(.{ .thinking = .{
+                            .thinking = try allocator_inner.dupe(u8, text.items),
+                            .signature = signature.*,
+                        } });
+                        signature.* = null;
+                    }
+                },
+            }
+
+            text.clearRetainingCapacity();
+            resetCurrentSignature(allocator_inner, signature);
+            current.* = .{};
+        }
+    };
+
     var usage: types.Usage = .{};
     var stop_reason: types.StopReason = .stop;
     var output = types.AssistantMessage{
         .text = "",
         .thinking = "",
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = model.api,
         .provider = model.provider,
@@ -831,15 +897,36 @@ fn parseGoogleSseResponse(
     defer full_text.deinit();
     var thinking = std.array_list.Managed(u8).init(allocator);
     defer thinking.deinit();
+    var current_text = std.array_list.Managed(u8).init(allocator);
+    defer current_text.deinit();
+    var current_signature: ?[]const u8 = null;
+    defer Helpers.resetCurrentSignature(allocator, &current_signature);
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
     var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
     defer tool_calls.deinit();
 
     var frame = std.array_list.Managed(u8).init(allocator);
     defer frame.deinit();
-    const block_index: usize = 0;
-    var saw_text = false;
-    var saw_thinking = false;
     var tool_index: usize = 0;
+    var next_content_index: usize = 0;
+    var current: CurrentBlock = .{};
 
     var lines = std.mem.splitScalar(u8, sse, '\n');
     while (lines.next()) |raw| {
@@ -889,29 +976,52 @@ fn parseGoogleSseResponse(
                                 if (part != .object) continue;
                                 if (part.object.get("text")) |text_v| {
                                     if (text_v == .string and text_v.string.len > 0) {
-                                        if (part.object.get("thought")) |thought_v| {
-                                            if (thought_v == .bool and thought_v.bool) {
-                                                if (!saw_thinking) {
-                                                    saw_thinking = true;
-                                                    try events.append(.{ .thinking_start = block_index });
-                                                }
-                                                try thinking.appendSlice(text_v.string);
-                                                try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, text_v.string);
-                                                continue;
+                                        const is_thinking = blk: {
+                                            if (part.object.get("thought")) |thought_v| {
+                                                if (thought_v == .bool and thought_v.bool) break :blk true;
                                             }
+                                            break :blk false;
+                                        };
+
+                                        if (is_thinking) {
+                                            if (current.kind != .thinking) {
+                                                try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+                                                current = .{
+                                                    .kind = .thinking,
+                                                    .content_index = next_content_index,
+                                                };
+                                                try events.append(.{ .thinking_start = next_content_index });
+                                                next_content_index += 1;
+                                            }
+                                            if (part.object.get("thoughtSignature")) |signature_v| {
+                                                if (signature_v == .string) {
+                                                    try Helpers.updateCurrentSignature(allocator, &current_signature, signature_v.string);
+                                                }
+                                            }
+                                            try current_text.appendSlice(text_v.string);
+                                            try thinking.appendSlice(text_v.string);
+                                            try payload_hooks.appendThinkingDelta(allocator, events, options, current.content_index, text_v.string);
+                                            continue;
                                         }
 
-                                        if (!saw_text) {
-                                            saw_text = true;
-                                            try events.append(.{ .text_start = block_index });
+                                        if (current.kind != .text) {
+                                            try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+                                            current = .{
+                                                .kind = .text,
+                                                .content_index = next_content_index,
+                                            };
+                                            try events.append(.{ .text_start = next_content_index });
+                                            next_content_index += 1;
                                         }
+                                        try current_text.appendSlice(text_v.string);
                                         try full_text.appendSlice(text_v.string);
-                                        try payload_hooks.appendTextDelta(allocator, events, options, block_index, text_v.string);
+                                        try payload_hooks.appendTextDelta(allocator, events, options, current.content_index, text_v.string);
                                     }
                                 }
 
                                 if (part.object.get("functionCall")) |fc_v| {
                                     if (fc_v != .object) continue;
+                                    try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
                                     const name_v = fc_v.object.get("name") orelse continue;
                                     if (name_v != .string) continue;
                                     const args_v = fc_v.object.get("args") orelse continue;
@@ -919,8 +1029,10 @@ fn parseGoogleSseResponse(
                                     defer allocator.free(args_json);
                                     const tool_id = try generateToolId(allocator, name_v.string, tool_index);
                                     tool_index += 1;
-                                    try events.append(.{ .toolcall_start = block_index + tool_calls.items.len + 1 });
-                                    try payload_hooks.appendToolCallDelta(allocator, events, options, block_index + tool_calls.items.len + 1, args_json);
+                                    const tool_content_index = next_content_index;
+                                    next_content_index += 1;
+                                    try events.append(.{ .toolcall_start = tool_content_index });
+                                    try payload_hooks.appendToolCallDelta(allocator, events, options, tool_content_index, args_json);
                                     const tool_call = types.ToolCall{
                                         .id = tool_id,
                                         .name = try allocator.dupe(u8, name_v.string),
@@ -928,7 +1040,7 @@ fn parseGoogleSseResponse(
                                     };
                                     try tool_calls.append(tool_call);
                                     try events.append(.{ .toolcall_end = .{
-                                        .content_index = block_index + tool_calls.items.len,
+                                        .content_index = tool_content_index,
                                         .tool_call = tool_call,
                                     } });
                                     stop_reason = .tool_use;
@@ -946,21 +1058,11 @@ fn parseGoogleSseResponse(
         }
     }
 
-    if (saw_text) {
-        try events.append(.{ .text_end = .{
-            .content_index = block_index,
-            .content = try allocator.dupe(u8, full_text.items),
-        } });
-    }
-    if (saw_thinking) {
-        try events.append(.{ .thinking_end = .{
-            .content_index = block_index,
-            .content = try allocator.dupe(u8, thinking.items),
-        } });
-    }
+    try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
 
     output.text = try allocator.dupe(u8, full_text.items);
     output.thinking = try allocator.dupe(u8, thinking.items);
+    output.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
     output.tool_calls = try tool_calls.toOwnedSlice();
     output.usage = usage;
     output.stop_reason = stop_reason;
@@ -1171,6 +1273,73 @@ test "google stop reason mapping" {
     try std.testing.expect(mapGoogleStopReason("TOOL_CALL") == .tool_use);
     try std.testing.expect(mapGoogleStopReason("SAFETY") == .err);
     try std.testing.expect(mapGoogleStopReason("FINISH_REASON_UNSPECIFIED") == .err);
+}
+
+test "google SSE parser preserves thought signatures in content blocks" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gemini-3-pro",
+        .name = "Gemini 3 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+    const sse =
+        \\data: {"candidates":[{"content":{"parts":[{"text":"thinking text","thought":true,"thoughtSignature":"sig-1"},{"text":"final answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}
+        \\
+        \\
+    ;
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |value| allocator.free(value.delta),
+                .text_end => |value| allocator.free(value.content),
+                .thinking_delta => |value| allocator.free(value.delta),
+                .thinking_end => |value| allocator.free(value.content),
+                .toolcall_delta => |value| allocator.free(value.delta),
+                .toolcall_end => |value| {
+                    allocator.free(value.tool_call.id);
+                    allocator.free(value.tool_call.name);
+                    allocator.free(value.tool_call.arguments_json);
+                },
+                .done => |value| {
+                    allocator.free(value.text);
+                    allocator.free(value.thinking);
+                    if (value.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
+                    for (value.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    if (value.tool_calls.len > 0) allocator.free(value.tool_calls);
+                },
+                .err => |value| allocator.free(value),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseGoogleSseResponse(allocator, sse, model, .{}, &events);
+    try std.testing.expect(events.items.len >= 4);
+    switch (events.items[events.items.len - 1]) {
+        .done => |msg| {
+            try std.testing.expect(msg.content_blocks != null);
+            try std.testing.expectEqual(@as(usize, 2), msg.content_blocks.?.len);
+            try std.testing.expect(msg.content_blocks.?[0] == .thinking);
+            try std.testing.expectEqualStrings("thinking text", msg.content_blocks.?[0].thinking.thinking);
+            try std.testing.expectEqualStrings("sig-1", msg.content_blocks.?[0].thinking.signature.?);
+            try std.testing.expect(msg.content_blocks.?[1] == .text);
+            try std.testing.expectEqualStrings("final answer", msg.content_blocks.?[1].text.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "parse google credentials supports raw token" {

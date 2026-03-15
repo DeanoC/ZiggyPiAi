@@ -11,6 +11,7 @@ fn freeMessageContent(
 ) void {
     if (message.text.len > 0) allocator.free(message.text);
     if (message.thinking.len > 0) allocator.free(message.thinking);
+    if (message.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
     if (message.error_message) |error_message| allocator.free(error_message);
     if (message.tool_calls.len > 0) {
         for (message.tool_calls) |tc| {
@@ -32,12 +33,23 @@ fn cloneToolCalls(
 ) ![]const types.ToolCall {
     if (source.len == 0) return &.{};
     const cloned = try allocator.alloc(types.ToolCall, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        while (initialized > 0) {
+            initialized -= 1;
+            allocator.free(cloned[initialized].id);
+            allocator.free(cloned[initialized].name);
+            allocator.free(cloned[initialized].arguments_json);
+        }
+        allocator.free(cloned);
+    }
     for (source, 0..) |tool_call, i| {
         cloned[i] = .{
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
             .arguments_json = try allocator.dupe(u8, tool_call.arguments_json),
         };
+        initialized += 1;
     }
     return cloned;
 }
@@ -47,9 +59,25 @@ fn cloneAssistantMessage(
     source: types.AssistantMessage,
 ) !types.AssistantMessage {
     const cloned_tool_calls = try cloneToolCalls(allocator, source.tool_calls);
+    errdefer {
+        if (cloned_tool_calls.len > 0) {
+            for (cloned_tool_calls) |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                allocator.free(tool_call.arguments_json);
+            }
+            allocator.free(cloned_tool_calls);
+        }
+    }
+    const cloned_content_blocks = if (source.content_blocks) |blocks|
+        try types.cloneMessageContents(allocator, blocks)
+    else
+        null;
+    errdefer if (cloned_content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
     return .{
         .text = try allocator.dupe(u8, source.text),
         .thinking = try allocator.dupe(u8, source.thinking),
+        .content_blocks = cloned_content_blocks,
         .tool_calls = cloned_tool_calls,
         .api = try allocator.dupe(u8, source.api),
         .provider = try allocator.dupe(u8, source.provider),
@@ -68,6 +96,7 @@ fn cloneFallbackError(
     return types.AssistantMessage{
         .text = try allocator.dupe(u8, ""),
         .thinking = try allocator.dupe(u8, ""),
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = try allocator.dupe(u8, model.api),
         .provider = try allocator.dupe(u8, model.provider),
@@ -103,6 +132,7 @@ pub fn freeCompleteMessage(
     message.* = .{
         .text = "",
         .thinking = "",
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = "",
         .provider = "",

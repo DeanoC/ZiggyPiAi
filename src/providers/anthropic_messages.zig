@@ -24,6 +24,8 @@ const CurrentTool = struct {
     args: std.array_list.Managed(u8),
 };
 
+const redacted_thinking_placeholder = "[Reasoning redacted]";
+
 fn stopReasonFromAnthropic(reason: []const u8) types.StopReason {
     if (std.mem.eql(u8, reason, "end_turn")) return .stop;
     if (std.mem.eql(u8, reason, "max_tokens")) return .length;
@@ -36,7 +38,10 @@ fn finishCurrent(
     kind: *CurrentKind,
     idx: usize,
     text: *std.array_list.Managed(u8),
+    thinking_signature: *std.array_list.Managed(u8),
+    thinking_redacted: *bool,
     tool: *CurrentTool,
+    content_blocks: *std.array_list.Managed(types.MessageContent),
     tool_calls: *std.array_list.Managed(types.ToolCall),
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
@@ -47,6 +52,11 @@ fn finishCurrent(
                 .content_index = idx,
                 .content = try allocator.dupe(u8, text.items),
             } });
+            if (text.items.len > 0) {
+                try content_blocks.append(.{ .text = .{
+                    .text = try allocator.dupe(u8, text.items),
+                } });
+            }
             text.clearRetainingCapacity();
         },
         .thinking => {
@@ -54,7 +64,19 @@ fn finishCurrent(
                 .content_index = idx,
                 .content = try allocator.dupe(u8, text.items),
             } });
+            if (text.items.len > 0 or thinking_signature.items.len > 0 or thinking_redacted.*) {
+                try content_blocks.append(.{ .thinking = .{
+                    .thinking = try allocator.dupe(u8, text.items),
+                    .signature = if (thinking_signature.items.len > 0)
+                        try allocator.dupe(u8, thinking_signature.items)
+                    else
+                        null,
+                    .redacted = thinking_redacted.*,
+                } });
+            }
             text.clearRetainingCapacity();
+            thinking_signature.clearRetainingCapacity();
+            thinking_redacted.* = false;
         },
         .tool => {
             const tc: types.ToolCall = .{
@@ -73,6 +95,36 @@ fn finishCurrent(
         },
     }
     kind.* = .none;
+}
+
+fn appendAssistantThinkingContentBlock(
+    writer: anytype,
+    block: types.ThinkingContent,
+) !bool {
+    if (block.redacted) {
+        if (block.signature) |signature| {
+            try writer.writeAll("{\"type\":\"redacted_thinking\",\"data\":");
+            try writeJson(writer, signature);
+            try writer.writeAll("}");
+            return true;
+        }
+        if (block.thinking.len == 0) return false;
+        try appendTextContentBlock(writer, block.thinking);
+        return true;
+    }
+
+    if (block.thinking.len == 0) return false;
+    if (block.signature) |signature| {
+        try writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
+        try writeJson(writer, block.thinking);
+        try writer.writeAll(",\"signature\":");
+        try writeJson(writer, signature);
+        try writer.writeAll("}");
+        return true;
+    }
+
+    try appendTextContentBlock(writer, block.thinking);
+    return true;
 }
 
 fn normalizeToolCallId(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
@@ -325,10 +377,11 @@ pub fn streamAnthropicMessages(
                             }
                         },
                         .thinking => |v| {
-                            if (v.thinking.len > 0) {
+                            if (v.redacted or v.signature != null or v.thinking.len > 0) {
                                 if (wrote_block) try body.writer().writeByte(',');
-                                try appendTextContentBlock(body.writer(), v.thinking);
-                                wrote_block = true;
+                                if (try appendAssistantThinkingContentBlock(body.writer(), v)) {
+                                    wrote_block = true;
+                                }
                             }
                         },
                         .image => {},
@@ -417,8 +470,28 @@ pub fn streamAnthropicMessages(
     defer thinking_all.deinit();
     var text_current = std.array_list.Managed(u8).init(allocator);
     defer text_current.deinit();
+    var current_thinking_signature = std.array_list.Managed(u8).init(allocator);
+    defer current_thinking_signature.deinit();
     var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
     defer tool_calls.deinit();
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
     var frame = std.array_list.Managed(u8).init(allocator);
     defer frame.deinit();
     var current_tool = CurrentTool{
@@ -444,6 +517,7 @@ pub fn streamAnthropicMessages(
     try events.append(.{ .start = out });
 
     var kind: CurrentKind = .none;
+    var current_thinking_redacted = false;
     var idx: usize = 0;
     var block_count: usize = 0;
 
@@ -479,7 +553,18 @@ pub fn streamAnthropicMessages(
                     }
                 }
             } else if (std.mem.eql(u8, type_v.string, "content_block_start")) {
-                if (kind != .none) try finishCurrent(allocator, &kind, idx, &text_current, &current_tool, &tool_calls, events);
+                if (kind != .none) try finishCurrent(
+                    allocator,
+                    &kind,
+                    idx,
+                    &text_current,
+                    &current_thinking_signature,
+                    &current_thinking_redacted,
+                    &current_tool,
+                    &content_blocks,
+                    &tool_calls,
+                    events,
+                );
                 idx = block_count;
                 block_count += 1;
                 const cb = root.object.get("content_block") orelse continue;
@@ -491,6 +576,21 @@ pub fn streamAnthropicMessages(
                     try events.append(.{ .text_start = idx });
                 } else if (std.mem.eql(u8, cbt.string, "thinking")) {
                     kind = .thinking;
+                    current_thinking_signature.clearRetainingCapacity();
+                    current_thinking_redacted = false;
+                    try events.append(.{ .thinking_start = idx });
+                } else if (std.mem.eql(u8, cbt.string, "redacted_thinking")) {
+                    kind = .thinking;
+                    current_thinking_signature.clearRetainingCapacity();
+                    current_thinking_redacted = true;
+                    text_current.clearRetainingCapacity();
+                    try text_current.appendSlice(redacted_thinking_placeholder);
+                    try thinking_all.appendSlice(redacted_thinking_placeholder);
+                    if (cb.object.get("data")) |value| {
+                        if (value == .string and value.string.len > 0) {
+                            try current_thinking_signature.appendSlice(value.string);
+                        }
+                    }
                     try events.append(.{ .thinking_start = idx });
                 } else if (std.mem.eql(u8, cbt.string, "tool_use")) {
                     kind = .tool;
@@ -529,6 +629,11 @@ pub fn streamAnthropicMessages(
                             try payload_hooks.appendThinkingDelta(allocator, events, options, idx, v.string);
                         }
                     }
+                    if (delta.object.get("signature")) |v| {
+                        if (v == .string and v.string.len > 0) {
+                            try current_thinking_signature.appendSlice(v.string);
+                        }
+                    }
                 } else if (kind == .tool) {
                     if (delta.object.get("partial_json")) |v| {
                         if (v == .string) {
@@ -538,7 +643,18 @@ pub fn streamAnthropicMessages(
                     }
                 }
             } else if (std.mem.eql(u8, type_v.string, "content_block_stop")) {
-                if (kind != .none) try finishCurrent(allocator, &kind, idx, &text_current, &current_tool, &tool_calls, events);
+                if (kind != .none) try finishCurrent(
+                    allocator,
+                    &kind,
+                    idx,
+                    &text_current,
+                    &current_thinking_signature,
+                    &current_thinking_redacted,
+                    &current_tool,
+                    &content_blocks,
+                    &tool_calls,
+                    events,
+                );
             } else if (std.mem.eql(u8, type_v.string, "message_delta")) {
                 if (root.object.get("delta")) |d| {
                     if (d == .object) {
@@ -579,10 +695,22 @@ pub fn streamAnthropicMessages(
             try frame.appendSlice(std.mem.trimLeft(u8, line["data:".len..], " "));
         }
     }
-    if (kind != .none) try finishCurrent(allocator, &kind, idx, &text_current, &current_tool, &tool_calls, events);
+    if (kind != .none) try finishCurrent(
+        allocator,
+        &kind,
+        idx,
+        &text_current,
+        &current_thinking_signature,
+        &current_thinking_redacted,
+        &current_tool,
+        &content_blocks,
+        &tool_calls,
+        events,
+    );
 
     out.text = try allocator.dupe(u8, text_all.items);
     out.thinking = try allocator.dupe(u8, thinking_all.items);
+    out.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = if (out.tool_calls.len > 0 and stop_reason == .stop) .tool_use else stop_reason;
@@ -593,4 +721,102 @@ test "anthropic stop reason mapping" {
     try std.testing.expect(stopReasonFromAnthropic("end_turn") == .stop);
     try std.testing.expect(stopReasonFromAnthropic("max_tokens") == .length);
     try std.testing.expect(stopReasonFromAnthropic("tool_use") == .tool_use);
+}
+
+test "anthropic assistant thinking blocks serialize signatures and redactions" {
+    const allocator = std.testing.allocator;
+
+    var signed = std.array_list.Managed(u8).init(allocator);
+    defer signed.deinit();
+    _ = try appendAssistantThinkingContentBlock(signed.writer(), .{
+        .thinking = "considering options",
+        .signature = "sig-123",
+    });
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"thinking\",\"thinking\":\"considering options\",\"signature\":\"sig-123\"}",
+        signed.items,
+    );
+
+    var redacted = std.array_list.Managed(u8).init(allocator);
+    defer redacted.deinit();
+    _ = try appendAssistantThinkingContentBlock(redacted.writer(), .{
+        .thinking = redacted_thinking_placeholder,
+        .signature = "opaque-redacted-payload",
+        .redacted = true,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted-payload\"}",
+        redacted.items,
+    );
+}
+
+test "anthropic finishCurrent preserves thinking metadata in content blocks" {
+    const allocator = std.testing.allocator;
+    var kind: CurrentKind = .thinking;
+    var text = std.array_list.Managed(u8).init(allocator);
+    defer text.deinit();
+    try text.appendSlice(redacted_thinking_placeholder);
+    var signature_buf = std.array_list.Managed(u8).init(allocator);
+    defer signature_buf.deinit();
+    try signature_buf.appendSlice("opaque-payload");
+    var redacted = true;
+    var tool = CurrentTool{
+        .id = std.array_list.Managed(u8).init(allocator),
+        .name = std.array_list.Managed(u8).init(allocator),
+        .args = std.array_list.Managed(u8).init(allocator),
+    };
+    defer {
+        tool.id.deinit();
+        tool.name.deinit();
+        tool.args.deinit();
+    }
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
+    var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
+    defer tool_calls.deinit();
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .thinking_end => |value| allocator.free(value.content),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try finishCurrent(
+        allocator,
+        &kind,
+        0,
+        &text,
+        &signature_buf,
+        &redacted,
+        &tool,
+        &content_blocks,
+        &tool_calls,
+        &events,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), content_blocks.items.len);
+    try std.testing.expect(content_blocks.items[0] == .thinking);
+    try std.testing.expectEqualStrings(redacted_thinking_placeholder, content_blocks.items[0].thinking.thinking);
+    try std.testing.expect(content_blocks.items[0].thinking.redacted);
+    try std.testing.expectEqualStrings("opaque-payload", content_blocks.items[0].thinking.signature.?);
 }

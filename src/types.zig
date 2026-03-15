@@ -43,6 +43,8 @@ pub const TextContent = struct {
 pub const ThinkingContent = struct {
     thinking: []const u8,
     signature: ?[]const u8 = null,
+    redacted: bool = false,
+    continuation_token: ?[]const u8 = null,
 };
 
 pub const ImageContent = struct {
@@ -181,6 +183,7 @@ pub const Context = struct {
 pub const AssistantMessage = struct {
     text: []const u8,
     thinking: []const u8 = "",
+    content_blocks: ?[]const MessageContent = null,
     tool_calls: []const ToolCall = &.{},
     api: Api,
     provider: Provider,
@@ -258,6 +261,88 @@ pub fn calculateCost(model: Model, usage: *Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
+pub fn cloneMessageContent(
+    allocator: std.mem.Allocator,
+    source: MessageContent,
+) !MessageContent {
+    return switch (source) {
+        .text => |value| .{
+            .text = .{
+                .text = try allocator.dupe(u8, value.text),
+            },
+        },
+        .thinking => |value| .{
+            .thinking = .{
+                .thinking = try allocator.dupe(u8, value.thinking),
+                .signature = if (value.signature) |signature| try allocator.dupe(u8, signature) else null,
+                .redacted = value.redacted,
+                .continuation_token = if (value.continuation_token) |token| try allocator.dupe(u8, token) else null,
+            },
+        },
+        .image => |value| .{
+            .image = .{
+                .data = try allocator.dupe(u8, value.data),
+                .mime_type = try allocator.dupe(u8, value.mime_type),
+            },
+        },
+    };
+}
+
+pub fn cloneMessageContents(
+    allocator: std.mem.Allocator,
+    source: []const MessageContent,
+) ![]const MessageContent {
+    if (source.len == 0) return &.{};
+    const cloned = try allocator.alloc(MessageContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        while (initialized > 0) {
+            initialized -= 1;
+            switch (cloned[initialized]) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        allocator.free(cloned);
+    }
+
+    for (source, 0..) |block, index| {
+        cloned[index] = try cloneMessageContent(allocator, block);
+        initialized += 1;
+    }
+
+    return cloned;
+}
+
+pub fn freeMessageContents(
+    allocator: std.mem.Allocator,
+    blocks: []const MessageContent,
+) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |value| allocator.free(value.text),
+            .thinking => |value| {
+                allocator.free(value.thinking);
+                if (value.signature) |signature| allocator.free(signature);
+                if (value.continuation_token) |token| allocator.free(token);
+            },
+            .image => |value| {
+                allocator.free(value.data);
+                allocator.free(value.mime_type);
+            },
+        }
+    }
+    if (blocks.len > 0) allocator.free(blocks);
+}
+
 test "calculateCost mirrors TS model" {
     var usage: Usage = .{
         .input = 1000,
@@ -300,6 +385,17 @@ test "thinking budget can use tokens or level" {
     try std.testing.expect(level_budget.tokens == null);
     try std.testing.expect(token_budget.tokens == 2048);
     try std.testing.expect(token_budget.level == null);
+}
+
+test "thinking content metadata defaults preserve compatibility" {
+    const thinking: ThinkingContent = .{
+        .thinking = "draft reasoning",
+    };
+
+    try std.testing.expectEqualStrings("draft reasoning", thinking.thinking);
+    try std.testing.expect(thinking.signature == null);
+    try std.testing.expect(!thinking.redacted);
+    try std.testing.expect(thinking.continuation_token == null);
 }
 
 test "gemini thinking can use budget tokens or level" {

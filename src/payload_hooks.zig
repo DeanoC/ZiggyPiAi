@@ -84,6 +84,7 @@ fn freeTestEventPayloads(allocator: std.mem.Allocator, events: *std.array_list.M
             .done => |*done| {
                 allocator.free(done.text);
                 allocator.free(done.thinking);
+                if (done.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
                 if (done.error_message) |err| allocator.free(err);
                 if (done.tool_calls.len > 0) allocator.free(done.tool_calls);
             },
@@ -107,6 +108,7 @@ test "appendDone records done event before invoking callback" {
     const message: types.AssistantMessage = .{
         .text = try allocator.dupe(u8, "done"),
         .thinking = try allocator.dupe(u8, ""),
+        .content_blocks = null,
         .tool_calls = &.{},
         .api = "api",
         .provider = "provider",

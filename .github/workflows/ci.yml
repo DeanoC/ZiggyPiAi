@@ -14,3 +14,4 @@ jobs:
         zig test src/integration_test.zig --test-filter "openai responses integration"
         zig test src/integration_test.zig --test-filter "codex spark originator integration"
         ./scripts/check-model-sync.sh
+        ./scripts/check-provider-parity.sh

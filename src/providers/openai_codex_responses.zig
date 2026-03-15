@@ -364,6 +364,15 @@ fn appendOutputTextItem(writer: anytype, text: []const u8, item_index: usize) !v
     try writer.writeAll("\"}");
 }
 
+fn isReasoningItem(
+    allocator: std.mem.Allocator,
+    signature: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
 fn splitToolCallId(tool_call_id: []const u8) struct { call_id: []const u8, item_id: ?[]const u8 } {
     const sep = std.mem.indexOfScalar(u8, tool_call_id, '|');
     if (sep) |idx| {
@@ -414,7 +423,9 @@ fn finishCurrent(
     current_kind: *CurrentKind,
     current_index: usize,
     text_buf: *std.array_list.Managed(u8),
+    current_thinking_signature: *?[]const u8,
     current_tool: *CurrentTool,
+    content_blocks: *std.array_list.Managed(types.MessageContent),
     tool_calls: *std.array_list.Managed(types.ToolCall),
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
@@ -425,6 +436,11 @@ fn finishCurrent(
                 .content_index = current_index,
                 .content = try allocator.dupe(u8, text_buf.items),
             } });
+            if (text_buf.items.len > 0) {
+                try content_blocks.append(.{ .text = .{
+                    .text = try allocator.dupe(u8, text_buf.items),
+                } });
+            }
             text_buf.clearRetainingCapacity();
         },
         .thinking => {
@@ -432,6 +448,13 @@ fn finishCurrent(
                 .content_index = current_index,
                 .content = try allocator.dupe(u8, text_buf.items),
             } });
+            if (text_buf.items.len > 0 or current_thinking_signature.* != null) {
+                try content_blocks.append(.{ .thinking = .{
+                    .thinking = try allocator.dupe(u8, text_buf.items),
+                    .signature = current_thinking_signature.*,
+                } });
+                current_thinking_signature.* = null;
+            }
             text_buf.clearRetainingCapacity();
         },
         .tool => {
@@ -449,6 +472,10 @@ fn finishCurrent(
             current_tool.name.clearRetainingCapacity();
             current_tool.args.clearRetainingCapacity();
         },
+    }
+    if (current_thinking_signature.*) |signature| {
+        allocator.free(signature);
+        current_thinking_signature.* = null;
     }
     current_kind.* = .none;
 }
@@ -556,13 +583,40 @@ fn buildResponsesRequestBody(
         if (msg.role == .assistant) {
             var wrote_item = false;
             var item_index: usize = 0;
+            var emitted_text_item = false;
 
             const text_output = try collectMessageText(allocator, msg);
             defer allocator.free(text_output);
-            if (text_output.len > 0) {
+
+            if (msg.content_blocks) |blocks| {
+                for (blocks) |block| {
+                    switch (block) {
+                        .thinking => |value| {
+                            const signature = value.signature orelse continue;
+                            if (!try isReasoningItem(allocator, signature)) continue;
+                            if (wrote_item) try body.writer().writeByte(',');
+                            try body.writer().writeAll(signature);
+                            wrote_item = true;
+                        },
+                        .text => |value| {
+                            if (emitted_text_item or value.text.len == 0 or text_output.len == 0) continue;
+                            if (wrote_item) try body.writer().writeByte(',');
+                            try appendOutputTextItem(body.writer(), text_output, item_index);
+                            item_index += 1;
+                            wrote_item = true;
+                            emitted_text_item = true;
+                        },
+                        .image => {},
+                    }
+                }
+            }
+
+            if (!emitted_text_item and text_output.len > 0) {
+                if (wrote_item) try body.writer().writeByte(',');
                 try appendOutputTextItem(body.writer(), text_output, item_index);
                 item_index += 1;
                 wrote_item = true;
+                emitted_text_item = true;
             }
 
             if (msg.tool_calls) |tool_calls| {
@@ -732,6 +786,7 @@ fn streamOpenAIResponsesBase(
         var out = types.AssistantMessage{
             .text = "",
             .thinking = "",
+            .content_blocks = null,
             .tool_calls = &.{},
             .api = model.api,
             .provider = model.provider,
@@ -746,6 +801,26 @@ fn streamOpenAIResponsesBase(
         defer full_text.deinit();
         var thinking = std.array_list.Managed(u8).init(allocator);
         defer thinking.deinit();
+        var current_thinking_signature: ?[]const u8 = null;
+        defer if (current_thinking_signature) |signature| allocator.free(signature);
+        var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+        defer {
+            for (content_blocks.items) |block| {
+                switch (block) {
+                    .text => |value| allocator.free(value.text),
+                    .thinking => |value| {
+                        allocator.free(value.thinking);
+                        if (value.signature) |signature| allocator.free(signature);
+                        if (value.continuation_token) |token| allocator.free(token);
+                    },
+                    .image => |value| {
+                        allocator.free(value.data);
+                        allocator.free(value.mime_type);
+                    },
+                }
+            }
+            content_blocks.deinit();
+        }
         var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
         defer tool_calls.deinit();
         var frame = std.array_list.Managed(u8).init(allocator);
@@ -787,7 +862,17 @@ fn streamOpenAIResponsesBase(
                     if (item != .object) continue;
                     const it = item.object.get("type") orelse continue;
                     if (it != .string) continue;
-                    if (current_kind != .none) try finishCurrent(allocator, &current_kind, current_index, &text_buf, &current_tool, &tool_calls, events);
+                    if (current_kind != .none) try finishCurrent(
+                        allocator,
+                        &current_kind,
+                        current_index,
+                        &text_buf,
+                        &current_thinking_signature,
+                        &current_tool,
+                        &content_blocks,
+                        &tool_calls,
+                        events,
+                    );
                     current_index = block_count;
                     block_count += 1;
                     if (std.mem.eql(u8, it.string, "reasoning")) {
@@ -842,7 +927,25 @@ fn streamOpenAIResponsesBase(
                     }
                 } else if (std.mem.eql(u8, t.string, "response.output_item.done")) {
                     if (current_kind != .none) {
-                        try finishCurrent(allocator, &current_kind, current_index, &text_buf, &current_tool, &tool_calls, events);
+                        if (current_kind == .thinking) {
+                            const item_v = root.object.get("item") orelse null;
+                            if (item_v != null and item_v.? == .object) {
+                                const item_json = try std.json.Stringify.valueAlloc(allocator, item_v.?, .{});
+                                if (current_thinking_signature) |existing| allocator.free(existing);
+                                current_thinking_signature = item_json;
+                            }
+                        }
+                        try finishCurrent(
+                            allocator,
+                            &current_kind,
+                            current_index,
+                            &text_buf,
+                            &current_thinking_signature,
+                            &current_tool,
+                            &content_blocks,
+                            &tool_calls,
+                            events,
+                        );
                     }
                 } else if (std.mem.eql(u8, t.string, "response.completed")) {
                     if (root.object.get("response")) |resp| {
@@ -913,9 +1016,20 @@ fn streamOpenAIResponsesBase(
             }
         }
 
-        if (current_kind != .none) try finishCurrent(allocator, &current_kind, current_index, &text_buf, &current_tool, &tool_calls, events);
+        if (current_kind != .none) try finishCurrent(
+            allocator,
+            &current_kind,
+            current_index,
+            &text_buf,
+            &current_thinking_signature,
+            &current_tool,
+            &content_blocks,
+            &tool_calls,
+            events,
+        );
         out.text = try allocator.dupe(u8, full_text.items);
         out.thinking = try allocator.dupe(u8, thinking.items);
+        out.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
         out.tool_calls = try tool_calls.toOwnedSlice();
         out.usage = usage;
         out.stop_reason = if (out.tool_calls.len > 0 and stop_reason == .stop) .tool_use else stop_reason;
@@ -1112,4 +1226,48 @@ test "openai responses request includes metadata only when provided" {
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\":{\"trace_id\":\"abc123\"}") != null);
+}
+
+test "openai responses request replays reasoning items from thinking signatures" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1_000_000,
+        .max_tokens = 1,
+    };
+    const blocks = [_]types.MessageContent{
+        .{ .thinking = .{
+            .thinking = "thinking text",
+            .signature = "{\"type\":\"reasoning\",\"id\":\"rs_123\",\"summary\":[],\"encrypted_content\":\"opaque\"}",
+        } },
+        .{ .text = .{ .text = "final answer" } },
+    };
+    const messages: []const types.Message = &.{
+        .{
+            .role = .assistant,
+            .content_blocks = &blocks,
+        },
+    };
+    const context: types.Context = .{
+        .messages = messages,
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{},
+        "https://api.openai.com/v1/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"reasoning\",\"id\":\"rs_123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"message\",\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"final answer\"") != null);
 }
