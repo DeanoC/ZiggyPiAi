@@ -6,6 +6,7 @@ pub const payload_hooks = @import("payload_hooks.zig");
 pub const stream = @import("stream.zig");
 pub const transform_messages = @import("transform_messages.zig");
 pub const oauth = struct {
+    pub const registry = @import("oauth/registry.zig");
     pub const openai_codex = @import("oauth/openai_codex_oauth.zig");
     pub const provider_oauth = @import("oauth/provider_oauth.zig");
     pub const provider_login_oauth = @import("oauth/provider_login_oauth.zig");
@@ -29,6 +30,7 @@ test {
     _ = stream;
     _ = transform_messages;
     _ = oauth;
+    _ = oauth.registry;
     _ = oauth.openai_codex;
     _ = oauth.provider_oauth;
     _ = oauth.provider_login_oauth;
