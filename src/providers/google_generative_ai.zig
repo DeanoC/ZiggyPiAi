@@ -148,6 +148,118 @@ fn resolveThinkingConfig(model: types.Model, options: types.StreamOptions) !?Goo
 
 const antigravity_instruction =
     "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
+const default_google_cli_endpoint = "https://cloudcode-pa.googleapis.com";
+const antigravity_daily_endpoint = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const antigravity_autopush_endpoint = "https://autopush-cloudcode-pa.sandbox.googleapis.com";
+const default_antigravity_version = "1.18.4";
+const base_retry_delay_ms: u64 = 1000;
+
+fn resolvedAntigravityConfig(options: types.StreamOptions) types.AntigravityConfig {
+    return options.antigravity orelse .{};
+}
+
+fn resolvedAntigravityClientVersion(
+    config: types.AntigravityConfig,
+    env_override: ?[]const u8,
+) []const u8 {
+    if (config.client_version) |version| {
+        if (version.len > 0) return version;
+    }
+    if (env_override) |version| {
+        if (version.len > 0) return version;
+    }
+    return default_antigravity_version;
+}
+
+fn loadAntigravityClientVersion(
+    allocator: std.mem.Allocator,
+    options: types.StreamOptions,
+) ![]const u8 {
+    const env_override = std.process.getEnvVarOwned(allocator, "PI_AI_ANTIGRAVITY_VERSION") catch null;
+    defer if (env_override) |value| allocator.free(value);
+    return allocator.dupe(u8, resolvedAntigravityClientVersion(resolvedAntigravityConfig(options), env_override));
+}
+
+fn buildAntigravityUserAgent(
+    allocator: std.mem.Allocator,
+    client_version: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "antigravity/{s} darwin/arm64", .{client_version});
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    values: *std.array_list.Managed([]const u8),
+    value: []const u8,
+) !void {
+    for (values.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try values.append(try allocator.dupe(u8, value));
+}
+
+fn deinitOwnedStringList(
+    allocator: std.mem.Allocator,
+    values: *std.array_list.Managed([]const u8),
+) void {
+    for (values.items) |value| allocator.free(value);
+    values.deinit();
+}
+
+fn buildAntigravityEndpoints(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+) !std.array_list.Managed([]const u8) {
+    const config = resolvedAntigravityConfig(options);
+    var endpoints = std.array_list.Managed([]const u8).init(allocator);
+    errdefer deinitOwnedStringList(allocator, &endpoints);
+
+    if (config.base_url) |base_url| {
+        try appendUniqueOwnedString(allocator, &endpoints, base_url);
+        if (config.fallback_base_url) |fallback| {
+            try appendUniqueOwnedString(allocator, &endpoints, fallback);
+        }
+        return endpoints;
+    }
+
+    try appendUniqueOwnedString(allocator, &endpoints, model.base_url);
+    if (config.fallback_base_url) |fallback| {
+        try appendUniqueOwnedString(allocator, &endpoints, fallback);
+        return endpoints;
+    }
+
+    try appendUniqueOwnedString(allocator, &endpoints, antigravity_daily_endpoint);
+    try appendUniqueOwnedString(allocator, &endpoints, antigravity_autopush_endpoint);
+    try appendUniqueOwnedString(allocator, &endpoints, default_google_cli_endpoint);
+    return endpoints;
+}
+
+fn retryDelayMs(options: types.StreamOptions, attempt: usize) u64 {
+    const base_delay = base_retry_delay_ms * (@as(u64, 1) << @intCast(attempt));
+    if (options.max_retry_delay_ms) |cap_ms| {
+        return @min(base_delay, @as(u64, cap_ms));
+    }
+    return base_delay;
+}
+
+fn isAntigravityEndpointFallbackStatus(status: std.http.Status) bool {
+    return status == .forbidden or status == .not_found;
+}
+
+fn isAntigravityRetryableStatus(status: std.http.Status) bool {
+    return status == .too_many_requests or
+        status == .internal_server_error or
+        status == .bad_gateway or
+        status == .service_unavailable or
+        status == .gateway_timeout;
+}
+
+fn needsAntigravityThinkingBetaHeader(model: types.Model) bool {
+    return std.mem.eql(u8, model.provider, "google-antigravity") and
+        std.mem.startsWith(u8, model.id, "claude-") and
+        model.reasoning;
+}
 
 const GoogleCredentials = struct {
     token: []const u8,
@@ -695,6 +807,268 @@ fn writeGenerateRequestBody(
     }
 }
 
+fn parseGoogleSseResponse(
+    allocator: std.mem.Allocator,
+    sse: []const u8,
+    model: types.Model,
+    options: types.StreamOptions,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    const CurrentBlockKind = enum { none, text, thinking };
+
+    const CurrentBlock = struct {
+        kind: CurrentBlockKind = .none,
+        content_index: usize = 0,
+    };
+
+    const Helpers = struct {
+        fn resetCurrentSignature(allocator_inner: std.mem.Allocator, signature: *?[]const u8) void {
+            if (signature.*) |value| allocator_inner.free(value);
+            signature.* = null;
+        }
+
+        fn updateCurrentSignature(
+            allocator_inner: std.mem.Allocator,
+            signature: *?[]const u8,
+            value: []const u8,
+        ) !void {
+            if (value.len == 0) return;
+            resetCurrentSignature(allocator_inner, signature);
+            signature.* = try allocator_inner.dupe(u8, value);
+        }
+
+        fn finishCurrentBlock(
+            allocator_inner: std.mem.Allocator,
+            current: *CurrentBlock,
+            text: *std.array_list.Managed(u8),
+            signature: *?[]const u8,
+            content_blocks: *std.array_list.Managed(types.MessageContent),
+            events_inner: *std.array_list.Managed(types.AssistantMessageEvent),
+        ) !void {
+            switch (current.kind) {
+                .none => {},
+                .text => {
+                    try events_inner.append(.{ .text_end = .{
+                        .content_index = current.content_index,
+                        .content = try allocator_inner.dupe(u8, text.items),
+                    } });
+                    if (text.items.len > 0) {
+                        try content_blocks.append(.{ .text = .{
+                            .text = try allocator_inner.dupe(u8, text.items),
+                        } });
+                    }
+                },
+                .thinking => {
+                    try events_inner.append(.{ .thinking_end = .{
+                        .content_index = current.content_index,
+                        .content = try allocator_inner.dupe(u8, text.items),
+                    } });
+                    if (text.items.len > 0 or signature.* != null) {
+                        try content_blocks.append(.{ .thinking = .{
+                            .thinking = try allocator_inner.dupe(u8, text.items),
+                            .signature = signature.*,
+                        } });
+                        signature.* = null;
+                    }
+                },
+            }
+
+            text.clearRetainingCapacity();
+            resetCurrentSignature(allocator_inner, signature);
+            current.* = .{};
+        }
+    };
+
+    var usage: types.Usage = .{};
+    var stop_reason: types.StopReason = .stop;
+    var output = types.AssistantMessage{
+        .text = "",
+        .thinking = "",
+        .content_blocks = null,
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = usage,
+    };
+    try events.append(.{ .start = output });
+
+    var full_text = std.array_list.Managed(u8).init(allocator);
+    defer full_text.deinit();
+    var thinking = std.array_list.Managed(u8).init(allocator);
+    defer thinking.deinit();
+    var current_text = std.array_list.Managed(u8).init(allocator);
+    defer current_text.deinit();
+    var current_signature: ?[]const u8 = null;
+    defer Helpers.resetCurrentSignature(allocator, &current_signature);
+    var content_blocks = std.array_list.Managed(types.MessageContent).init(allocator);
+    defer {
+        for (content_blocks.items) |block| {
+            switch (block) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        content_blocks.deinit();
+    }
+    var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
+    defer tool_calls.deinit();
+
+    var frame = std.array_list.Managed(u8).init(allocator);
+    defer frame.deinit();
+    var tool_index: usize = 0;
+    var next_content_index: usize = 0;
+    var current: CurrentBlock = .{};
+
+    var lines = std.mem.splitScalar(u8, sse, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimRight(u8, raw, "\r");
+        if (line.len == 0) {
+            if (frame.items.len == 0) continue;
+            const payload = std.mem.trim(u8, frame.items, " ");
+            frame.clearRetainingCapacity();
+            if (!std.mem.startsWith(u8, payload, "{")) continue;
+            try payload_hooks.dispatchRawJson(options, payload);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const root = parsed.value.object;
+
+            if (root.get("usageMetadata")) |usage_v| {
+                if (usage_v == .object) {
+                    if (usage_v.object.get("promptTokenCount")) |v| {
+                        if (v == .integer) usage.input = @intCast(v.integer);
+                    }
+                    if (usage_v.object.get("candidatesTokenCount")) |v| {
+                        if (v == .integer) usage.output = @intCast(v.integer);
+                    }
+                    if (usage_v.object.get("totalTokenCount")) |v| {
+                        if (v == .integer) usage.total_tokens = @intCast(v.integer);
+                    }
+                    types.calculateCost(model, &usage);
+                    try payload_hooks.dispatchUsage(options, usage);
+                }
+            }
+
+            const candidates_v = root.get("candidates") orelse continue;
+            if (candidates_v != .array or candidates_v.array.items.len == 0) continue;
+            const candidate = candidates_v.array.items[0];
+            if (candidate != .object) continue;
+
+            if (candidate.object.get("finishReason")) |fr| {
+                if (fr == .string) stop_reason = mapGoogleStopReason(fr.string);
+            }
+
+            if (candidate.object.get("content")) |content_v| {
+                if (content_v == .object) {
+                    if (content_v.object.get("parts")) |parts_v| {
+                        if (parts_v == .array) {
+                            for (parts_v.array.items) |part| {
+                                if (part != .object) continue;
+                                if (part.object.get("text")) |text_v| {
+                                    if (text_v == .string and text_v.string.len > 0) {
+                                        const is_thinking = blk: {
+                                            if (part.object.get("thought")) |thought_v| {
+                                                if (thought_v == .bool and thought_v.bool) break :blk true;
+                                            }
+                                            break :blk false;
+                                        };
+
+                                        if (is_thinking) {
+                                            if (current.kind != .thinking) {
+                                                try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+                                                current = .{
+                                                    .kind = .thinking,
+                                                    .content_index = next_content_index,
+                                                };
+                                                try events.append(.{ .thinking_start = next_content_index });
+                                                next_content_index += 1;
+                                            }
+                                            if (part.object.get("thoughtSignature")) |signature_v| {
+                                                if (signature_v == .string) {
+                                                    try Helpers.updateCurrentSignature(allocator, &current_signature, signature_v.string);
+                                                }
+                                            }
+                                            try current_text.appendSlice(text_v.string);
+                                            try thinking.appendSlice(text_v.string);
+                                            try payload_hooks.appendThinkingDelta(allocator, events, options, current.content_index, text_v.string);
+                                            continue;
+                                        }
+
+                                        if (current.kind != .text) {
+                                            try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+                                            current = .{
+                                                .kind = .text,
+                                                .content_index = next_content_index,
+                                            };
+                                            try events.append(.{ .text_start = next_content_index });
+                                            next_content_index += 1;
+                                        }
+                                        try current_text.appendSlice(text_v.string);
+                                        try full_text.appendSlice(text_v.string);
+                                        try payload_hooks.appendTextDelta(allocator, events, options, current.content_index, text_v.string);
+                                    }
+                                }
+
+                                if (part.object.get("functionCall")) |fc_v| {
+                                    if (fc_v != .object) continue;
+                                    try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+                                    const name_v = fc_v.object.get("name") orelse continue;
+                                    if (name_v != .string) continue;
+                                    const args_v = fc_v.object.get("args") orelse continue;
+                                    const args_json = try std.json.Stringify.valueAlloc(allocator, args_v, .{});
+                                    defer allocator.free(args_json);
+                                    const tool_id = try generateToolId(allocator, name_v.string, tool_index);
+                                    tool_index += 1;
+                                    const tool_content_index = next_content_index;
+                                    next_content_index += 1;
+                                    try events.append(.{ .toolcall_start = tool_content_index });
+                                    try payload_hooks.appendToolCallDelta(allocator, events, options, tool_content_index, args_json);
+                                    const tool_call = types.ToolCall{
+                                        .id = tool_id,
+                                        .name = try allocator.dupe(u8, name_v.string),
+                                        .arguments_json = try allocator.dupe(u8, args_json),
+                                    };
+                                    try tool_calls.append(tool_call);
+                                    try events.append(.{ .toolcall_end = .{
+                                        .content_index = tool_content_index,
+                                        .tool_call = tool_call,
+                                    } });
+                                    stop_reason = .tool_use;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "data:")) {
+            try frame.appendSlice(std.mem.trimLeft(u8, line["data:".len..], " "));
+        }
+    }
+
+    try Helpers.finishCurrentBlock(allocator, &current, &current_text, &current_signature, &content_blocks, events);
+
+    output.text = try allocator.dupe(u8, full_text.items);
+    output.thinking = try allocator.dupe(u8, thinking.items);
+    output.content_blocks = if (content_blocks.items.len > 0) try content_blocks.toOwnedSlice() else null;
+    output.tool_calls = try tool_calls.toOwnedSlice();
+    output.usage = usage;
+    output.stop_reason = stop_reason;
+    try payload_hooks.appendDone(events, options, output);
+}
+
 pub fn streamGoogleGenerativeAI(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -709,6 +1083,8 @@ pub fn streamGoogleGenerativeAI(
     defer endpoint.deinit();
     var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
+    var antigravity_endpoints: ?std.array_list.Managed([]const u8) = null;
+    defer if (antigravity_endpoints) |*values| deinitOwnedStringList(allocator, values);
 
     var headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer headers.deinit();
@@ -728,6 +1104,7 @@ pub fn streamGoogleGenerativeAI(
         try writeGenerateRequestBody(allocator, body.writer(), model, context, options, true, false, false);
         try body.writer().writeByte('}');
     } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
+        const is_antigravity = std.mem.eql(u8, model.provider, "google-antigravity");
         var creds = try parseGoogleCredentials(allocator, api_key);
         defer deinitGoogleCredentials(allocator, &creds);
         const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
@@ -735,18 +1112,22 @@ pub fn streamGoogleGenerativeAI(
         try appendHeader(&headers, "authorization", auth);
         try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
         try appendHeader(&headers, "client-metadata", "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}");
-        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
-            try appendHeader(&headers, "user-agent", "antigravity/1.15.8 darwin/arm64");
-            if (containsCaseInsensitive(model.id, "claude") and containsCaseInsensitive(model.id, "thinking")) {
+        if (is_antigravity) {
+            antigravity_endpoints = try buildAntigravityEndpoints(allocator, model, options);
+            const client_version = try loadAntigravityClientVersion(allocator, options);
+            defer allocator.free(client_version);
+            const user_agent = try buildAntigravityUserAgent(allocator, client_version);
+            defer allocator.free(user_agent);
+            try appendHeader(&headers, "user-agent", user_agent);
+            if (needsAntigravityThinkingBetaHeader(model)) {
                 try appendHeader(&headers, "anthropic-beta", "interleaved-thinking-2025-05-14");
             }
         } else {
             try appendHeader(&headers, "user-agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+            const endpoint_owned = try std.fmt.allocPrint(allocator, "{s}/v1internal:streamGenerateContent?alt=sse", .{base});
+            defer allocator.free(endpoint_owned);
+            try endpoint.appendSlice(endpoint_owned);
         }
-
-        const endpoint_owned = try std.fmt.allocPrint(allocator, "{s}/v1internal:streamGenerateContent?alt=sse", .{base});
-        defer allocator.free(endpoint_owned);
-        try endpoint.appendSlice(endpoint_owned);
 
         const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
         defer allocator.free(project_id);
@@ -813,181 +1194,77 @@ pub fn streamGoogleGenerativeAI(
         for (custom_headers) |h| try appendHeader(&headers, h.name, h.value);
     }
 
-    var req = try client.request(.POST, try std.Uri.parse(endpoint.items), .{
-        .extra_headers = headers.items,
-    });
-    defer req.deinit();
-    try req.sendBodyComplete(body.items);
-
-    var redirect_buf: [4096]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status != .ok) {
-        var err_buf = std.array_list.Managed(u8).init(allocator);
-        defer err_buf.deinit();
-        var transfer_buffer: [8192]u8 = undefined;
-        const err_reader = response.reader(&transfer_buffer);
-        try readAllResponseBody(err_reader, &err_buf);
-        try events.append(.{ .err = try allocator.dupe(u8, err_buf.items) });
-        return;
-    }
-
     var sse = std.array_list.Managed(u8).init(allocator);
     defer sse.deinit();
-    var transfer_buffer: [8192]u8 = undefined;
-    const response_reader = response.reader(&transfer_buffer);
-    try readAllResponseBody(response_reader, &sse);
 
-    var usage: types.Usage = .{};
-    var stop_reason: types.StopReason = .stop;
-    var output = types.AssistantMessage{
-        .text = "",
-        .thinking = "",
-        .tool_calls = &.{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = usage,
-    };
-    try events.append(.{ .start = output });
+    if (antigravity_endpoints) |*endpoints| {
+        var endpoint_index: usize = 0;
+        var attempt: usize = 0;
+        while (true) {
+            const request_url = try std.fmt.allocPrint(
+                allocator,
+                "{s}/v1internal:streamGenerateContent?alt=sse",
+                .{endpoints.items[endpoint_index]},
+            );
+            defer allocator.free(request_url);
 
-    var full_text = std.array_list.Managed(u8).init(allocator);
-    defer full_text.deinit();
-    var thinking = std.array_list.Managed(u8).init(allocator);
-    defer thinking.deinit();
-    var tool_calls = std.array_list.Managed(types.ToolCall).init(allocator);
-    defer tool_calls.deinit();
+            var req = try client.request(.POST, try std.Uri.parse(request_url), .{
+                .extra_headers = headers.items,
+            });
+            defer req.deinit();
+            try req.sendBodyComplete(body.items);
 
-    var frame = std.array_list.Managed(u8).init(allocator);
-    defer frame.deinit();
-    const block_index: usize = 0;
-    var saw_text = false;
-    var saw_thinking = false;
-    var tool_index: usize = 0;
+            var redirect_buf: [4096]u8 = undefined;
+            var response = try req.receiveHead(&redirect_buf);
+            sse.clearRetainingCapacity();
+            var transfer_buffer: [8192]u8 = undefined;
+            const response_reader = response.reader(&transfer_buffer);
+            try readAllResponseBody(response_reader, &sse);
 
-    var lines = std.mem.splitScalar(u8, sse.items, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimRight(u8, raw, "\r");
-        if (line.len == 0) {
-            if (frame.items.len == 0) continue;
-            const payload = std.mem.trim(u8, frame.items, " ");
-            frame.clearRetainingCapacity();
-            if (!std.mem.startsWith(u8, payload, "{")) continue;
-            try payload_hooks.dispatchRawJson(options, payload);
+            if (response.head.status == .ok) break;
 
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .object) continue;
-            const root = parsed.value.object;
+            if (isAntigravityEndpointFallbackStatus(response.head.status) and endpoint_index + 1 < endpoints.items.len) {
+                endpoint_index += 1;
+                continue;
+            }
 
-            if (root.get("usageMetadata")) |usage_v| {
-                if (usage_v == .object) {
-                    if (usage_v.object.get("promptTokenCount")) |v| {
-                        if (v == .integer) usage.input = @intCast(v.integer);
-                    }
-                    if (usage_v.object.get("candidatesTokenCount")) |v| {
-                        if (v == .integer) usage.output = @intCast(v.integer);
-                    }
-                    if (usage_v.object.get("totalTokenCount")) |v| {
-                        if (v == .integer) usage.total_tokens = @intCast(v.integer);
-                    }
-                    types.calculateCost(model, &usage);
-                    try payload_hooks.dispatchUsage(options, usage);
+            if (isAntigravityRetryableStatus(response.head.status) and attempt < 3) {
+                if (endpoint_index + 1 < endpoints.items.len) {
+                    endpoint_index += 1;
                 }
+                std.Thread.sleep(retryDelayMs(options, attempt) * std.time.ns_per_ms);
+                attempt += 1;
+                continue;
             }
 
-            const candidates_v = root.get("candidates") orelse continue;
-            if (candidates_v != .array or candidates_v.array.items.len == 0) continue;
-            const candidate = candidates_v.array.items[0];
-            if (candidate != .object) continue;
+            try events.append(.{ .err = try allocator.dupe(u8, sse.items) });
+            return;
+        }
+    } else {
+        var req = try client.request(.POST, try std.Uri.parse(endpoint.items), .{
+            .extra_headers = headers.items,
+        });
+        defer req.deinit();
+        try req.sendBodyComplete(body.items);
 
-            if (candidate.object.get("finishReason")) |fr| {
-                if (fr == .string) stop_reason = mapGoogleStopReason(fr.string);
-            }
-
-            if (candidate.object.get("content")) |content_v| {
-                if (content_v == .object) {
-                    if (content_v.object.get("parts")) |parts_v| {
-                        if (parts_v == .array) {
-                            for (parts_v.array.items) |part| {
-                                if (part != .object) continue;
-                                if (part.object.get("text")) |text_v| {
-                                    if (text_v == .string and text_v.string.len > 0) {
-                                        if (part.object.get("thought")) |thought_v| {
-                                            if (thought_v == .bool and thought_v.bool) {
-                                                if (!saw_thinking) {
-                                                    saw_thinking = true;
-                                                    try events.append(.{ .thinking_start = block_index });
-                                                }
-                                                try thinking.appendSlice(text_v.string);
-                                                try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, text_v.string);
-                                                continue;
-                                            }
-                                        }
-
-                                        if (!saw_text) {
-                                            saw_text = true;
-                                            try events.append(.{ .text_start = block_index });
-                                        }
-                                        try full_text.appendSlice(text_v.string);
-                                        try payload_hooks.appendTextDelta(allocator, events, options, block_index, text_v.string);
-                                    }
-                                }
-
-                                if (part.object.get("functionCall")) |fc_v| {
-                                    if (fc_v != .object) continue;
-                                    const name_v = fc_v.object.get("name") orelse continue;
-                                    if (name_v != .string) continue;
-                                    const args_v = fc_v.object.get("args") orelse continue;
-                                    const args_json = try std.json.Stringify.valueAlloc(allocator, args_v, .{});
-                                    defer allocator.free(args_json);
-                                    const tool_id = try generateToolId(allocator, name_v.string, tool_index);
-                                    tool_index += 1;
-                                    try events.append(.{ .toolcall_start = block_index + tool_calls.items.len + 1 });
-                                    try payload_hooks.appendToolCallDelta(allocator, events, options, block_index + tool_calls.items.len + 1, args_json);
-                                    const tool_call = types.ToolCall{
-                                        .id = tool_id,
-                                        .name = try allocator.dupe(u8, name_v.string),
-                                        .arguments_json = try allocator.dupe(u8, args_json),
-                                    };
-                                    try tool_calls.append(tool_call);
-                                    try events.append(.{ .toolcall_end = .{
-                                        .content_index = block_index + tool_calls.items.len,
-                                        .tool_call = tool_call,
-                                    } });
-                                    stop_reason = .tool_use;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            continue;
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+        if (response.head.status != .ok) {
+            var err_buf = std.array_list.Managed(u8).init(allocator);
+            defer err_buf.deinit();
+            var transfer_buffer: [8192]u8 = undefined;
+            const err_reader = response.reader(&transfer_buffer);
+            try readAllResponseBody(err_reader, &err_buf);
+            try events.append(.{ .err = try allocator.dupe(u8, err_buf.items) });
+            return;
         }
 
-        if (std.mem.startsWith(u8, line, "data:")) {
-            try frame.appendSlice(std.mem.trimLeft(u8, line["data:".len..], " "));
-        }
+        var transfer_buffer: [8192]u8 = undefined;
+        const response_reader = response.reader(&transfer_buffer);
+        try readAllResponseBody(response_reader, &sse);
     }
 
-    if (saw_text) {
-        try events.append(.{ .text_end = .{
-            .content_index = block_index,
-            .content = try allocator.dupe(u8, full_text.items),
-        } });
-    }
-    if (saw_thinking) {
-        try events.append(.{ .thinking_end = .{
-            .content_index = block_index,
-            .content = try allocator.dupe(u8, thinking.items),
-        } });
-    }
-
-    output.text = try allocator.dupe(u8, full_text.items);
-    output.thinking = try allocator.dupe(u8, thinking.items);
-    output.tool_calls = try tool_calls.toOwnedSlice();
-    output.usage = usage;
-    output.stop_reason = stop_reason;
-    try payload_hooks.appendDone(events, options, output);
+    try parseGoogleSseResponse(allocator, sse.items, model, options, events);
 }
 
 test "google stop reason mapping" {
@@ -996,6 +1273,73 @@ test "google stop reason mapping" {
     try std.testing.expect(mapGoogleStopReason("TOOL_CALL") == .tool_use);
     try std.testing.expect(mapGoogleStopReason("SAFETY") == .err);
     try std.testing.expect(mapGoogleStopReason("FINISH_REASON_UNSPECIFIED") == .err);
+}
+
+test "google SSE parser preserves thought signatures in content blocks" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gemini-3-pro",
+        .name = "Gemini 3 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 65_536,
+    };
+    const sse =
+        \\data: {"candidates":[{"content":{"parts":[{"text":"thinking text","thought":true,"thoughtSignature":"sig-1"},{"text":"final answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}
+        \\
+        \\
+    ;
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |value| allocator.free(value.delta),
+                .text_end => |value| allocator.free(value.content),
+                .thinking_delta => |value| allocator.free(value.delta),
+                .thinking_end => |value| allocator.free(value.content),
+                .toolcall_delta => |value| allocator.free(value.delta),
+                .toolcall_end => |value| {
+                    allocator.free(value.tool_call.id);
+                    allocator.free(value.tool_call.name);
+                    allocator.free(value.tool_call.arguments_json);
+                },
+                .done => |value| {
+                    allocator.free(value.text);
+                    allocator.free(value.thinking);
+                    if (value.content_blocks) |blocks| types.freeMessageContents(allocator, blocks);
+                    for (value.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    if (value.tool_calls.len > 0) allocator.free(value.tool_calls);
+                },
+                .err => |value| allocator.free(value),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseGoogleSseResponse(allocator, sse, model, .{}, &events);
+    try std.testing.expect(events.items.len >= 4);
+    switch (events.items[events.items.len - 1]) {
+        .done => |msg| {
+            try std.testing.expect(msg.content_blocks != null);
+            try std.testing.expectEqual(@as(usize, 2), msg.content_blocks.?.len);
+            try std.testing.expect(msg.content_blocks.?[0] == .thinking);
+            try std.testing.expectEqualStrings("thinking text", msg.content_blocks.?[0].thinking.thinking);
+            try std.testing.expectEqualStrings("sig-1", msg.content_blocks.?[0].thinking.signature.?);
+            try std.testing.expect(msg.content_blocks.?[1] == .text);
+            try std.testing.expectEqualStrings("final answer", msg.content_blocks.?[1].text.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "parse google credentials supports raw token" {
@@ -1087,6 +1431,83 @@ test "antigravity instruction wrapper is formatted" {
     defer allocator.free(wrapped);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[ignore]") != null);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[/ignore]") != null);
+}
+
+test "antigravity client version prefers config override" {
+    try std.testing.expectEqualStrings(
+        "2.0.0",
+        resolvedAntigravityClientVersion(.{ .client_version = "2.0.0" }, "1.18.4"),
+    );
+    try std.testing.expectEqualStrings(
+        "1.18.4",
+        resolvedAntigravityClientVersion(.{}, "1.18.4"),
+    );
+    try std.testing.expectEqualStrings(
+        default_antigravity_version,
+        resolvedAntigravityClientVersion(.{}, null),
+    );
+}
+
+test "antigravity endpoint list matches upstream fallback order" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "claude-opus-4-5-thinking",
+        .name = "Claude Opus 4.5 Thinking (Antigravity)",
+        .api = "google-gemini-cli",
+        .provider = "google-antigravity",
+        .base_url = antigravity_daily_endpoint,
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 64_000,
+    };
+
+    var endpoints = try buildAntigravityEndpoints(allocator, model, .{});
+    defer deinitOwnedStringList(allocator, &endpoints);
+
+    try std.testing.expectEqual(@as(usize, 3), endpoints.items.len);
+    try std.testing.expectEqualStrings(antigravity_daily_endpoint, endpoints.items[0]);
+    try std.testing.expectEqualStrings(antigravity_autopush_endpoint, endpoints.items[1]);
+    try std.testing.expectEqualStrings(default_google_cli_endpoint, endpoints.items[2]);
+}
+
+test "antigravity explicit endpoints override built-in fallback chain" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "claude-opus-4-5-thinking",
+        .name = "Claude Opus 4.5 Thinking (Antigravity)",
+        .api = "google-gemini-cli",
+        .provider = "google-antigravity",
+        .base_url = antigravity_daily_endpoint,
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 64_000,
+    };
+
+    var endpoints = try buildAntigravityEndpoints(
+        allocator,
+        model,
+        .{
+            .antigravity = .{
+                .base_url = "https://custom-antigravity.example.com",
+                .fallback_base_url = "https://backup-antigravity.example.com",
+            },
+        },
+    );
+    defer deinitOwnedStringList(allocator, &endpoints);
+
+    try std.testing.expectEqual(@as(usize, 2), endpoints.items.len);
+    try std.testing.expectEqualStrings("https://custom-antigravity.example.com", endpoints.items[0]);
+    try std.testing.expectEqualStrings("https://backup-antigravity.example.com", endpoints.items[1]);
+}
+
+test "antigravity fallback status classification is explicit" {
+    try std.testing.expect(isAntigravityEndpointFallbackStatus(.forbidden));
+    try std.testing.expect(isAntigravityEndpointFallbackStatus(.not_found));
+    try std.testing.expect(isAntigravityRetryableStatus(.too_many_requests));
+    try std.testing.expect(isAntigravityRetryableStatus(.service_unavailable));
+    try std.testing.expect(!isAntigravityRetryableStatus(.bad_request));
 }
 
 test "google request body includes thinking budget when configured" {

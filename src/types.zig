@@ -43,6 +43,8 @@ pub const TextContent = struct {
 pub const ThinkingContent = struct {
     thinking: []const u8,
     signature: ?[]const u8 = null,
+    redacted: bool = false,
+    continuation_token: ?[]const u8 = null,
 };
 
 pub const ImageContent = struct {
@@ -96,6 +98,31 @@ pub const GeminiThinking = union(enum) {
     level: ThinkingLevel,
 };
 
+pub const ToolChoice = union(enum) {
+    auto,
+    any,
+    tool: []const u8,
+};
+
+pub const ReasoningOptions = struct {
+    effort: ?ThinkingLevel = null,
+};
+
+pub const BedrockOptions = struct {
+    region: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    tool_choice: ?ToolChoice = null,
+    reasoning: ?ReasoningOptions = null,
+    thinking_budget: ?ThinkingBudget = null,
+    interleaved_thinking: ?bool = null,
+};
+
+pub const AntigravityConfig = struct {
+    base_url: ?[]const u8 = null,
+    fallback_base_url: ?[]const u8 = null,
+    client_version: ?[]const u8 = null,
+};
+
 pub const MetadataEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -141,6 +168,8 @@ pub const StreamOptions = struct {
     metadata: ?[]const MetadataEntry = null,
     thinking_budget: ?ThinkingBudget = null,
     gemini_thinking: ?GeminiThinking = null,
+    bedrock: ?BedrockOptions = null,
+    antigravity: ?AntigravityConfig = null,
     on_payload: ?*const fn (ctx: ?*anyopaque, payload: ProviderPayload) anyerror!void = null,
     on_payload_ctx: ?*anyopaque = null,
 };
@@ -154,6 +183,7 @@ pub const Context = struct {
 pub const AssistantMessage = struct {
     text: []const u8,
     thinking: []const u8 = "",
+    content_blocks: ?[]const MessageContent = null,
     tool_calls: []const ToolCall = &.{},
     api: Api,
     provider: Provider,
@@ -231,6 +261,88 @@ pub fn calculateCost(model: Model, usage: *Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
+pub fn cloneMessageContent(
+    allocator: std.mem.Allocator,
+    source: MessageContent,
+) !MessageContent {
+    return switch (source) {
+        .text => |value| .{
+            .text = .{
+                .text = try allocator.dupe(u8, value.text),
+            },
+        },
+        .thinking => |value| .{
+            .thinking = .{
+                .thinking = try allocator.dupe(u8, value.thinking),
+                .signature = if (value.signature) |signature| try allocator.dupe(u8, signature) else null,
+                .redacted = value.redacted,
+                .continuation_token = if (value.continuation_token) |token| try allocator.dupe(u8, token) else null,
+            },
+        },
+        .image => |value| .{
+            .image = .{
+                .data = try allocator.dupe(u8, value.data),
+                .mime_type = try allocator.dupe(u8, value.mime_type),
+            },
+        },
+    };
+}
+
+pub fn cloneMessageContents(
+    allocator: std.mem.Allocator,
+    source: []const MessageContent,
+) ![]const MessageContent {
+    if (source.len == 0) return &.{};
+    const cloned = try allocator.alloc(MessageContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        while (initialized > 0) {
+            initialized -= 1;
+            switch (cloned[initialized]) {
+                .text => |value| allocator.free(value.text),
+                .thinking => |value| {
+                    allocator.free(value.thinking);
+                    if (value.signature) |signature| allocator.free(signature);
+                    if (value.continuation_token) |token| allocator.free(token);
+                },
+                .image => |value| {
+                    allocator.free(value.data);
+                    allocator.free(value.mime_type);
+                },
+            }
+        }
+        allocator.free(cloned);
+    }
+
+    for (source, 0..) |block, index| {
+        cloned[index] = try cloneMessageContent(allocator, block);
+        initialized += 1;
+    }
+
+    return cloned;
+}
+
+pub fn freeMessageContents(
+    allocator: std.mem.Allocator,
+    blocks: []const MessageContent,
+) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |value| allocator.free(value.text),
+            .thinking => |value| {
+                allocator.free(value.thinking);
+                if (value.signature) |signature| allocator.free(signature);
+                if (value.continuation_token) |token| allocator.free(token);
+            },
+            .image => |value| {
+                allocator.free(value.data);
+                allocator.free(value.mime_type);
+            },
+        }
+    }
+    if (blocks.len > 0) allocator.free(blocks);
+}
+
 test "calculateCost mirrors TS model" {
     var usage: Usage = .{
         .input = 1000,
@@ -260,6 +372,8 @@ test "stream options include parity defaults" {
     try std.testing.expect(opts.metadata == null);
     try std.testing.expect(opts.thinking_budget == null);
     try std.testing.expect(opts.gemini_thinking == null);
+    try std.testing.expect(opts.bedrock == null);
+    try std.testing.expect(opts.antigravity == null);
     try std.testing.expect(opts.on_payload == null);
     try std.testing.expect(opts.on_payload_ctx == null);
 }
@@ -273,6 +387,17 @@ test "thinking budget can use tokens or level" {
     try std.testing.expect(token_budget.level == null);
 }
 
+test "thinking content metadata defaults preserve compatibility" {
+    const thinking: ThinkingContent = .{
+        .thinking = "draft reasoning",
+    };
+
+    try std.testing.expectEqualStrings("draft reasoning", thinking.thinking);
+    try std.testing.expect(thinking.signature == null);
+    try std.testing.expect(!thinking.redacted);
+    try std.testing.expect(thinking.continuation_token == null);
+}
+
 test "gemini thinking can use budget tokens or level" {
     const level_thinking: GeminiThinking = .{ .level = .medium };
     const budget_thinking: GeminiThinking = .{ .budget_tokens = 4096 };
@@ -280,4 +405,35 @@ test "gemini thinking can use budget tokens or level" {
     try std.testing.expect(level_thinking.level == .medium);
     try std.testing.expect(budget_thinking == .budget_tokens);
     try std.testing.expectEqual(@as(u32, 4096), budget_thinking.budget_tokens);
+}
+
+test "bedrock options support provider-specific overrides" {
+    const bedrock: BedrockOptions = .{
+        .region = "us-west-2",
+        .profile = "dev",
+        .tool_choice = .{ .tool = "get_weather" },
+        .reasoning = .{ .effort = .high },
+        .thinking_budget = .{ .tokens = 4096 },
+        .interleaved_thinking = true,
+    };
+
+    try std.testing.expectEqualStrings("us-west-2", bedrock.region.?);
+    try std.testing.expectEqualStrings("dev", bedrock.profile.?);
+    try std.testing.expect(bedrock.tool_choice.? == .tool);
+    try std.testing.expectEqualStrings("get_weather", bedrock.tool_choice.?.tool);
+    try std.testing.expect(bedrock.reasoning.?.effort.? == .high);
+    try std.testing.expectEqual(@as(u32, 4096), bedrock.thinking_budget.?.tokens.?);
+    try std.testing.expectEqual(true, bedrock.interleaved_thinking.?);
+}
+
+test "antigravity config supports endpoint and version overrides" {
+    const antigravity: AntigravityConfig = .{
+        .base_url = "https://daily-cloudcode-pa.sandbox.googleapis.com",
+        .fallback_base_url = "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+        .client_version = "1.18.4",
+    };
+
+    try std.testing.expectEqualStrings("https://daily-cloudcode-pa.sandbox.googleapis.com", antigravity.base_url.?);
+    try std.testing.expectEqualStrings("https://autopush-cloudcode-pa.sandbox.googleapis.com", antigravity.fallback_base_url.?);
+    try std.testing.expectEqualStrings("1.18.4", antigravity.client_version.?);
 }

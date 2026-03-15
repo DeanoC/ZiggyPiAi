@@ -1,0 +1,1650 @@
+{
+  "shared_option_fields": [
+    "antigravity",
+    "api_key",
+    "bedrock",
+    "cache_retention",
+    "gemini_thinking",
+    "headers",
+    "max_retry_delay_ms",
+    "max_tokens",
+    "metadata",
+    "on_payload",
+    "on_payload_ctx",
+    "reasoning",
+    "reasoning_summary",
+    "session_id",
+    "temperature",
+    "text_verbosity",
+    "thinking_budget",
+    "transport"
+  ],
+  "apis": [
+    {
+      "api": "anthropic-messages",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/anthropic_messages.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "max_tokens",
+        "on_payload",
+        "on_payload_ctx",
+        "transport"
+      ]
+    },
+    {
+      "api": "azure-openai-responses",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/openai_codex_responses.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "headers",
+        "max_retry_delay_ms",
+        "metadata",
+        "on_payload",
+        "on_payload_ctx",
+        "reasoning",
+        "reasoning_summary",
+        "session_id",
+        "text_verbosity",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "bedrock-converse-stream",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/bedrock_converse_stream.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "bedrock",
+        "headers",
+        "max_tokens",
+        "metadata",
+        "on_payload",
+        "on_payload_ctx",
+        "reasoning",
+        "temperature",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "google-gemini-cli",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/google_generative_ai.zig",
+      "recognized_option_fields": [
+        "antigravity",
+        "api_key",
+        "gemini_thinking",
+        "headers",
+        "max_retry_delay_ms",
+        "max_tokens",
+        "on_payload",
+        "on_payload_ctx",
+        "session_id",
+        "temperature",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "google-generative-ai",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/google_generative_ai.zig",
+      "recognized_option_fields": [
+        "antigravity",
+        "api_key",
+        "gemini_thinking",
+        "headers",
+        "max_retry_delay_ms",
+        "max_tokens",
+        "on_payload",
+        "on_payload_ctx",
+        "session_id",
+        "temperature",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "google-vertex",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/google_generative_ai.zig",
+      "recognized_option_fields": [
+        "antigravity",
+        "api_key",
+        "gemini_thinking",
+        "headers",
+        "max_retry_delay_ms",
+        "max_tokens",
+        "on_payload",
+        "on_payload_ctx",
+        "session_id",
+        "temperature",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "openai-codex-responses",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/openai_codex_responses.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "headers",
+        "max_retry_delay_ms",
+        "metadata",
+        "on_payload",
+        "on_payload_ctx",
+        "reasoning",
+        "reasoning_summary",
+        "session_id",
+        "text_verbosity",
+        "thinking_budget",
+        "transport"
+      ]
+    },
+    {
+      "api": "openai-completions",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/openai_compat.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "headers",
+        "max_tokens",
+        "on_payload",
+        "on_payload_ctx",
+        "temperature",
+        "transport"
+      ]
+    },
+    {
+      "api": "openai-responses",
+      "supports_sse": true,
+      "supports_websocket": false,
+      "source_file": "src/providers/openai_codex_responses.zig",
+      "recognized_option_fields": [
+        "api_key",
+        "headers",
+        "max_retry_delay_ms",
+        "metadata",
+        "on_payload",
+        "on_payload_ctx",
+        "reasoning",
+        "reasoning_summary",
+        "session_id",
+        "text_verbosity",
+        "thinking_budget",
+        "transport"
+      ]
+    }
+  ],
+  "providers": [
+    "amazon-bedrock",
+    "anthropic",
+    "azure-openai-responses",
+    "cerebras",
+    "github-copilot",
+    "google",
+    "google-antigravity",
+    "google-gemini-cli",
+    "google-vertex",
+    "groq",
+    "huggingface",
+    "kimi-code",
+    "kimi-coding",
+    "minimax",
+    "minimax-cn",
+    "mistral",
+    "openai",
+    "openai-codex",
+    "openai-codex-spark",
+    "opencode",
+    "openrouter",
+    "vercel-ai-gateway",
+    "xai",
+    "zai"
+  ],
+  "model_aliases": [
+    {
+      "model_id": "anthropic/claude-3-haiku",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-3.5-haiku",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-3.5-sonnet",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-3.7-sonnet",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-haiku-4.5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-opus-4",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-opus-4.1",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-opus-4.5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-opus-4.6",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-sonnet-4",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "anthropic/claude-sonnet-4.5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "claude-haiku-4-5",
+      "providers": [
+        "anthropic",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "claude-opus-4-1",
+      "providers": [
+        "anthropic",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "claude-opus-4-5",
+      "providers": [
+        "anthropic",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "providers": [
+        "anthropic",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "claude-sonnet-4",
+      "providers": [
+        "github-copilot",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "claude-sonnet-4-5",
+      "providers": [
+        "anthropic",
+        "google-antigravity",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "google-gemini-cli"
+      ]
+    },
+    {
+      "model_id": "codex-mini-latest",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "deepseek/deepseek-v3.1-terminus",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "deepseek/deepseek-v3.2",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "gemini-1.5-flash",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-1.5-flash-8b",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-1.5-pro",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.0-flash",
+      "providers": [
+        "google",
+        "google-gemini-cli",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.0-flash-lite",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.5-flash",
+      "providers": [
+        "google",
+        "google-gemini-cli",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.5-flash-lite",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.5-flash-lite-preview-09-2025",
+      "providers": [
+        "google",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-generative-ai",
+        "google-vertex"
+      ]
+    },
+    {
+      "model_id": "gemini-2.5-pro",
+      "providers": [
+        "github-copilot",
+        "google",
+        "google-gemini-cli",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai",
+        "google-vertex",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "gemini-3-flash",
+      "providers": [
+        "google-antigravity",
+        "opencode"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai"
+      ]
+    },
+    {
+      "model_id": "gemini-3-flash-preview",
+      "providers": [
+        "github-copilot",
+        "google",
+        "google-gemini-cli",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai",
+        "google-vertex",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "gemini-3-pro-preview",
+      "providers": [
+        "github-copilot",
+        "google",
+        "google-gemini-cli",
+        "google-vertex"
+      ],
+      "apis": [
+        "google-gemini-cli",
+        "google-generative-ai",
+        "google-vertex",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "glm-4.6",
+      "providers": [
+        "opencode",
+        "zai"
+      ],
+      "apis": [
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "glm-4.7",
+      "providers": [
+        "opencode",
+        "zai"
+      ],
+      "apis": [
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-2.5-flash",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-2.5-flash-lite",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-2.5-flash-lite-preview-09-2025",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-2.5-flash-preview-09-2025",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-2.5-pro",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "google/gemini-3-pro-preview",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "gpt-4",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4-turbo",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4.1",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-completions",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4.1-mini",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4.1-nano",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4o",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-completions",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4o-2024-05-13",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4o-2024-08-06",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4o-2024-11-20",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-4o-mini",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5-chat-latest",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5-codex",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5-mini",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5-nano",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5-pro",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.1",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "openai-codex",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.1-chat-latest",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.1-codex",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.1-codex-max",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "openai-codex",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.1-codex-mini",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "openai-codex",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.2",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "openai-codex",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.2-chat-latest",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.2-codex",
+      "providers": [
+        "azure-openai-responses",
+        "github-copilot",
+        "openai",
+        "openai-codex",
+        "opencode"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.2-pro",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.3-codex",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "openai-codex"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.3-codex-spark",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "openai-codex"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.4",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "openai-codex"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "gpt-5.4_smallcontext",
+      "providers": [
+        "azure-openai-responses",
+        "openai",
+        "openai-codex"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "grok-code-fast-1",
+      "providers": [
+        "github-copilot",
+        "xai"
+      ],
+      "apis": [
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "k2p5",
+      "providers": [
+        "kimi-code",
+        "kimi-coding"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "kimi-k2-thinking",
+      "providers": [
+        "kimi-code",
+        "kimi-coding",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "kimi-k2.5",
+      "providers": [
+        "kimi-code",
+        "kimi-coding",
+        "opencode"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "MiniMax-M2",
+      "providers": [
+        "minimax",
+        "minimax-cn"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "MiniMax-M2.1",
+      "providers": [
+        "minimax",
+        "minimax-cn"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "MiniMax-M2.5",
+      "providers": [
+        "minimax",
+        "minimax-cn"
+      ],
+      "apis": [
+        "anthropic-messages"
+      ]
+    },
+    {
+      "model_id": "minimax/minimax-m2",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "minimax/minimax-m2.1",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "minimax/minimax-m2.5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "moonshotai/kimi-k2",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "moonshotai/kimi-k2-thinking",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "moonshotai/kimi-k2.5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "nvidia/nemotron-nano-9b-v2",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "o1",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o1-pro",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o3",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o3-deep-research",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o3-mini",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o3-pro",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o4-mini",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "o4-mini-deep-research",
+      "providers": [
+        "azure-openai-responses",
+        "openai"
+      ],
+      "apis": [
+        "azure-openai-responses",
+        "openai-responses"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4-turbo",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4.1",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4.1-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4.1-nano",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4o",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-4o-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5-codex",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5-nano",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5-pro",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.1-codex",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.1-codex-max",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.1-codex-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.2",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.2-chat",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.2-codex",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-5.2-pro",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-oss-120b",
+      "providers": [
+        "groq",
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-oss-20b",
+      "providers": [
+        "groq",
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/gpt-oss-safeguard-20b",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o1",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o3",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o3-deep-research",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o3-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o3-pro",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "openai/o4-mini",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "prime-intellect/intellect-3",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "qwen/qwen3-32b",
+      "providers": [
+        "groq",
+        "openrouter"
+      ],
+      "apis": [
+        "openai-completions"
+      ]
+    },
+    {
+      "model_id": "xiaomi/mimo-v2-flash",
+      "providers": [
+        "openrouter",
+        "vercel-ai-gateway"
+      ],
+      "apis": [
+        "anthropic-messages",
+        "openai-completions"
+      ]
+    }
+  ],
+  "triaged_upstream": {
+    "source": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/ai/src/types.ts",
+    "known_api_ids": [
+      "anthropic-messages",
+      "azure-openai-responses",
+      "bedrock-converse-stream",
+      "google-gemini-cli",
+      "google-generative-ai",
+      "google-vertex",
+      "mistral-conversations",
+      "openai-codex-responses",
+      "openai-completions",
+      "openai-responses"
+    ],
+    "known_provider_ids": [
+      "amazon-bedrock",
+      "anthropic",
+      "azure-openai-responses",
+      "cerebras",
+      "github-copilot",
+      "google",
+      "google-antigravity",
+      "google-gemini-cli",
+      "google-vertex",
+      "groq",
+      "huggingface",
+      "kimi-coding",
+      "minimax",
+      "minimax-cn",
+      "mistral",
+      "openai",
+      "openai-codex",
+      "opencode",
+      "opencode-go",
+      "openrouter",
+      "vercel-ai-gateway",
+      "xai",
+      "zai"
+    ],
+    "stream_option_fields": [
+      "apiKey",
+      "cacheRetention",
+      "headers",
+      "maxRetryDelayMs",
+      "maxTokens",
+      "metadata",
+      "onPayload",
+      "sessionId",
+      "signal",
+      "temperature",
+      "transport"
+    ]
+  }
+}
