@@ -22,6 +22,13 @@ pub fn freeTokenSet(allocator: std.mem.Allocator, tokens: *TokenSet) void {
     tokens.* = undefined;
 }
 
+pub fn freeOAuthProvidersList(allocator: std.mem.Allocator, providers: []OAuthProvider) void {
+    for (providers) |provider| {
+        allocator.free(provider.name);
+    }
+    allocator.free(providers);
+}
+
 pub const BrowserAuthStart = struct {
     verifier: []const u8,
     state: []const u8,
@@ -355,11 +362,13 @@ pub fn listOAuthProviders(allocator: std.mem.Allocator) ![]OAuthProvider {
     registry_state.mutex.lock();
     defer registry_state.mutex.unlock();
 
-    var out = try allocator.alloc(OAuthProvider, registry_state.map.count());
-    var it = registry_state.map.iterator();
+    const out = try allocator.alloc(OAuthProvider, registry_state.map.count());
     var idx: usize = 0;
+    errdefer freeOAuthProvidersList(allocator, out[0..idx]);
+    var it = registry_state.map.iterator();
     while (it.next()) |entry| : (idx += 1) {
         out[idx] = entry.value_ptr.*;
+        out[idx].name = try allocator.dupe(u8, entry.value_ptr.name);
     }
     return out;
 }
@@ -391,6 +400,12 @@ pub fn refreshToken(allocator: std.mem.Allocator, provider_name: []const u8, par
 pub fn formatApiKey(allocator: std.mem.Allocator, provider_name: []const u8, tokens: TokenSet) ![]const u8 {
     const provider = getOAuthProvider(provider_name) orelse return error.OAuthProviderNotRegistered;
     const formatter = provider.format_api_key orelse defaultFormatApiKey;
+    return try formatter(allocator, tokens);
+}
+
+fn formatStoredApiKey(allocator: std.mem.Allocator, provider_name: []const u8, tokens: TokenSet) ![]const u8 {
+    const provider = getOAuthProvider(provider_name);
+    const formatter = if (provider) |p| p.format_api_key orelse defaultFormatApiKey else defaultFormatApiKey;
     return try formatter(allocator, tokens);
 }
 
@@ -729,7 +744,7 @@ pub fn getPiOAuthApiKeyFromPath(
 
         const latest_now_ms: u64 = @intCast(std.time.milliTimestamp());
         if (latest_now_ms < latest.expires_at_ms) {
-            return formatApiKey(allocator, provider, latest) catch null;
+            return formatStoredApiKey(allocator, provider, latest) catch null;
         }
 
         var refreshed = refreshToken(allocator, provider, .{
@@ -739,15 +754,15 @@ pub fn getPiOAuthApiKeyFromPath(
         }) catch return null;
         defer freeTokenSet(allocator, &refreshed);
         writeOAuthCredentialsToFile(allocator, auth_path, provider, refreshed) catch {};
-        return formatApiKey(allocator, provider, refreshed) catch null;
+        return formatStoredApiKey(allocator, provider, refreshed) catch null;
     }
-    return formatApiKey(allocator, provider, tokens) catch null;
+    return formatStoredApiKey(allocator, provider, tokens) catch null;
 }
 
 test "oauth registry lists builtin providers" {
     const allocator = std.testing.allocator;
     const providers = try listOAuthProviders(allocator);
-    defer allocator.free(providers);
+    defer freeOAuthProvidersList(allocator, providers);
 
     var saw_codex = false;
     var saw_anthropic = false;
@@ -767,6 +782,39 @@ test "oauth registry lists builtin providers" {
     try std.testing.expect(saw_gemini);
     try std.testing.expect(saw_antigravity);
     try std.testing.expect(saw_copilot);
+}
+
+test "oauth registry list snapshot owns provider names" {
+    const Custom = struct {
+        fn refresh(allocator: std.mem.Allocator, params: RefreshTokenParams) !TokenSet {
+            _ = params;
+            return .{
+                .access = try allocator.dupe(u8, "snapshot-access"),
+                .refresh = try allocator.dupe(u8, "snapshot-refresh"),
+                .expires_at_ms = 4_102_444_800_000,
+            };
+        }
+    };
+
+    defer resetOAuthProvidersForTests();
+    try registerOAuthProvider(.{
+        .name = "snapshot-provider",
+        .refresh_token = Custom.refresh,
+    });
+
+    const allocator = std.testing.allocator;
+    const providers = try listOAuthProviders(allocator);
+    defer freeOAuthProvidersList(allocator, providers);
+
+    unregisterOAuthProvider("snapshot-provider");
+
+    var saw_snapshot = false;
+    for (providers) |provider| {
+        if (std.mem.eql(u8, provider.name, "snapshot-provider")) {
+            saw_snapshot = true;
+        }
+    }
+    try std.testing.expect(saw_snapshot);
 }
 
 test "oauth registry resolves custom provider auth entries without core edits" {
@@ -820,6 +868,31 @@ test "oauth registry resolves custom provider auth entries without core edits" {
 
     unregisterOAuthProvider("custom-oauth");
     try std.testing.expect(getOAuthProvider("custom-oauth") == null);
+}
+
+test "oauth registry preserves stored token fallback for unregistered providers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".pi/agent");
+    const file = try tmp.dir.createFile(".pi/agent/auth.json", .{});
+    defer file.close();
+    try file.writeAll(
+        \\{"legacy-provider":{"type":"oauth","access":"legacy-access","refresh":"legacy-refresh","expires":4102444800000}}
+    );
+
+    const cwd_realpath = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_realpath);
+    const full_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/.pi/agent/auth.json",
+        .{ cwd_realpath, tmp.sub_path },
+    );
+    defer allocator.free(full_path);
+
+    const api_key = getPiOAuthApiKeyFromPath(allocator, "legacy-provider", full_path) orelse return error.TestExpectedEqual;
+    defer allocator.free(api_key);
+    try std.testing.expectEqualStrings("legacy-access", api_key);
 }
 
 test "oauth registry reset removes custom providers and restores builtins" {
