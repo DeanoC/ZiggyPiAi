@@ -1,5 +1,6 @@
 const std = @import("std");
 const codex = @import("openai_codex_oauth.zig");
+const registry = @import("registry.zig");
 
 const anthropic_client_id_b64 = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl";
 
@@ -485,20 +486,22 @@ fn providerApiKey(allocator: std.mem.Allocator, provider: []const u8, creds: OAu
     return allocator.dupe(u8, creds.access) catch null;
 }
 
+fn toRegistryTokenSet(allocator: std.mem.Allocator, creds: OAuthCredentials) !registry.TokenSet {
+    return .{
+        .access = try allocator.dupe(u8, creds.access),
+        .refresh = try allocator.dupe(u8, creds.refresh),
+        .expires_at_ms = creds.expires_at_ms,
+        .project_id = if (creds.project_id) |v| try allocator.dupe(u8, v) else null,
+        .enterprise_url = if (creds.enterprise_url) |v| try allocator.dupe(u8, v) else null,
+    };
+}
+
 pub fn getPiOAuthApiKey(allocator: std.mem.Allocator, provider: []const u8) ?[]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
-    defer allocator.free(home);
-    const auth_path = piAuthPathFromHome(allocator, home) orelse return null;
-    defer allocator.free(auth_path);
-    return getPiOAuthApiKeyFromPath(allocator, provider, auth_path);
+    return registry.getPiOAuthApiKey(allocator, provider);
 }
 
 pub fn getPiApiKeyEntry(allocator: std.mem.Allocator, provider: []const u8) ?[]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
-    defer allocator.free(home);
-    const auth_path = piAuthPathFromHome(allocator, home) orelse return null;
-    defer allocator.free(auth_path);
-    return readApiKeyEntryFromFile(allocator, auth_path, provider);
+    return registry.getPiApiKeyEntry(allocator, provider);
 }
 
 pub fn savePiOAuthCredentials(
@@ -506,22 +509,16 @@ pub fn savePiOAuthCredentials(
     provider: []const u8,
     creds: OAuthCredentials,
 ) !void {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
-    const auth_path = piAuthPathFromHome(allocator, home) orelse return error.OutOfMemory;
-    defer allocator.free(auth_path);
-    try writeOAuthCredentialsToFile(allocator, auth_path, provider, creds);
+    var tokens = try toRegistryTokenSet(allocator, creds);
+    defer registry.freeTokenSet(allocator, &tokens);
+    try registry.savePiOAuthCredentials(allocator, provider, tokens);
 }
 
 pub fn removePiAuthProviderEntry(
     allocator: std.mem.Allocator,
     provider: []const u8,
 ) !void {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
-    defer allocator.free(home);
-    const auth_path = piAuthPathFromHome(allocator, home) orelse return;
-    defer allocator.free(auth_path);
-    try removeProviderEntryFromFile(allocator, auth_path, provider);
+    try registry.removePiAuthProviderEntry(allocator, provider);
 }
 
 pub fn getPiOAuthApiKeyFromPath(
@@ -529,27 +526,7 @@ pub fn getPiOAuthApiKeyFromPath(
     provider: []const u8,
     auth_path: []const u8,
 ) ?[]const u8 {
-    var creds = readOAuthCredentialsFromFile(allocator, auth_path, provider) orelse return null;
-    defer freeOAuthCredentials(allocator, &creds);
-
-    const now_ms: u64 = @intCast(std.time.milliTimestamp());
-    if (now_ms >= creds.expires_at_ms) {
-        var lock = acquireAuthFileLock(allocator, auth_path) catch return null;
-        defer lock.release(allocator);
-
-        var latest = readOAuthCredentialsFromFile(allocator, auth_path, provider) orelse return null;
-        defer freeOAuthCredentials(allocator, &latest);
-        const latest_now_ms: u64 = @intCast(std.time.milliTimestamp());
-        if (latest_now_ms < latest.expires_at_ms) {
-            return providerApiKey(allocator, provider, latest);
-        }
-
-        var refreshed = refreshOAuthToken(allocator, provider, latest) catch return null;
-        defer freeOAuthCredentials(allocator, &refreshed);
-        writeOAuthCredentialsToFile(allocator, auth_path, provider, refreshed) catch {};
-        return providerApiKey(allocator, provider, refreshed);
-    }
-    return providerApiKey(allocator, provider, creds);
+    return registry.getPiOAuthApiKeyFromPath(allocator, provider, auth_path);
 }
 
 test "pi oauth resolves google-gemini-cli key payload" {

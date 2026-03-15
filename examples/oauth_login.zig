@@ -2,8 +2,7 @@ const std = @import("std");
 const ziggy_piai = @import("ziggypiai");
 
 const codex_oauth = ziggy_piai.oauth.openai_codex;
-const provider_oauth = ziggy_piai.oauth.provider_oauth;
-const provider_login = ziggy_piai.oauth.provider_login_oauth;
+const oauth_registry = ziggy_piai.oauth.registry;
 
 const SupportedProvider = enum {
     openai_codex,
@@ -127,122 +126,51 @@ fn promptAuthorizationCode(allocator: std.mem.Allocator, auth_url: []const u8, e
     return allocator.dupe(u8, code);
 }
 
-fn saveFromCodexCredentials(
-    allocator: std.mem.Allocator,
-    provider: SupportedProvider,
-    creds: codex_oauth.OAuthCredentials,
-) !void {
-    var to_store = provider_oauth.OAuthCredentials{
-        .access = try allocator.dupe(u8, creds.access),
-        .refresh = try allocator.dupe(u8, creds.refresh),
-        .expires_at_ms = creds.expires_at_ms,
-        .project_id = null,
-        .enterprise_url = null,
+fn runOAuthFlow(allocator: std.mem.Allocator, provider: SupportedProvider, enterprise_domain: ?[]const u8) !void {
+    const provider_name = storageProviderName(provider);
+    var auth_start = try oauth_registry.beginAuth(allocator, provider_name, .{
+        .originator = "pi",
+        .enterprise_domain = enterprise_domain,
+    });
+    defer oauth_registry.freeAuthStart(allocator, &auth_start);
+
+    var tokens = switch (auth_start) {
+        .browser => |browser| try blk: {
+            const code = try promptAuthorizationCode(allocator, browser.url, browser.state);
+            defer allocator.free(code);
+
+            break :blk oauth_registry.exchangeToken(allocator, provider_name, .{
+                .code = code,
+                .state = browser.state,
+                .verifier = browser.verifier,
+                .redirect_uri = if (provider == .openai_codex or provider == .openai_codex_spark) codex_oauth.REDIRECT_URI else null,
+            });
+        },
+        .device => |device| try blk: {
+            try println("", .{});
+            try println("Complete device login:", .{});
+            try println("  URL:  {s}", .{device.verification_uri});
+            try println("  Code: {s}", .{device.user_code});
+            try println("Waiting for authorization...", .{});
+
+            break :blk oauth_registry.exchangeToken(allocator, provider_name, .{
+                .device_code = device.device_code,
+                .interval_seconds = device.interval_seconds,
+                .expires_in_seconds = device.expires_in_seconds,
+                .enterprise_domain = enterprise_domain,
+            });
+        },
     };
-    defer provider_oauth.freeOAuthCredentials(allocator, &to_store);
+    defer oauth_registry.freeTokenSet(allocator, &tokens);
 
-    try provider_oauth.savePiOAuthCredentials(allocator, storageProviderName(provider), to_store);
-}
-
-fn saveFromProviderLoginCredentials(
-    allocator: std.mem.Allocator,
-    provider: SupportedProvider,
-    creds: provider_login.OAuthCredentials,
-) !void {
-    var to_store = provider_oauth.OAuthCredentials{
-        .access = try allocator.dupe(u8, creds.access),
-        .refresh = try allocator.dupe(u8, creds.refresh),
-        .expires_at_ms = creds.expires_at_ms,
-        .project_id = if (creds.project_id) |value| try allocator.dupe(u8, value) else null,
-        .enterprise_url = if (creds.enterprise_url) |value| try allocator.dupe(u8, value) else null,
-    };
-    defer provider_oauth.freeOAuthCredentials(allocator, &to_store);
-
-    try provider_oauth.savePiOAuthCredentials(allocator, storageProviderName(provider), to_store);
-}
-
-fn runOpenAICodexFlow(allocator: std.mem.Allocator, provider: SupportedProvider) !void {
-    var flow = try codex_oauth.createAuthorizationFlow(allocator, "pi");
-    defer codex_oauth.freeAuthorizationFlow(allocator, &flow);
-
-    const code = try promptAuthorizationCode(allocator, flow.url, flow.state);
-    defer allocator.free(code);
-
-    var creds = try codex_oauth.exchangeAuthorizationCode(allocator, code, flow.verifier, codex_oauth.REDIRECT_URI);
-    defer codex_oauth.freeCredentials(allocator, &creds);
-
-    try saveFromCodexCredentials(allocator, provider, creds);
-}
-
-fn runAnthropicFlow(allocator: std.mem.Allocator) !void {
-    var flow = try provider_login.createAnthropicAuthorizationFlow(allocator);
-    defer provider_login.freeAuthorizationFlow(allocator, &flow);
-
-    const code = try promptAuthorizationCode(allocator, flow.url, flow.state);
-    defer allocator.free(code);
-
-    var creds = try provider_login.exchangeAnthropicAuthorizationCode(allocator, code, flow.state, flow.verifier);
-    defer provider_login.freeOAuthCredentials(allocator, &creds);
-
-    try saveFromProviderLoginCredentials(allocator, .anthropic, creds);
-}
-
-fn runGoogleGeminiCliFlow(allocator: std.mem.Allocator) !void {
-    var flow = try provider_login.createGoogleGeminiCliAuthorizationFlow(allocator);
-    defer provider_login.freeAuthorizationFlow(allocator, &flow);
-
-    const code = try promptAuthorizationCode(allocator, flow.url, flow.state);
-    defer allocator.free(code);
-
-    var creds = try provider_login.exchangeGoogleGeminiCliAuthorizationCode(allocator, code, flow.verifier);
-    defer provider_login.freeOAuthCredentials(allocator, &creds);
-
-    try saveFromProviderLoginCredentials(allocator, .google_gemini_cli, creds);
-}
-
-fn runGoogleAntigravityFlow(allocator: std.mem.Allocator) !void {
-    var flow = try provider_login.createGoogleAntigravityAuthorizationFlow(allocator);
-    defer provider_login.freeAuthorizationFlow(allocator, &flow);
-
-    const code = try promptAuthorizationCode(allocator, flow.url, flow.state);
-    defer allocator.free(code);
-
-    var creds = try provider_login.exchangeGoogleAntigravityAuthorizationCode(allocator, code, flow.verifier);
-    defer provider_login.freeOAuthCredentials(allocator, &creds);
-
-    try saveFromProviderLoginCredentials(allocator, .google_antigravity, creds);
-}
-
-fn runGithubCopilotFlow(allocator: std.mem.Allocator, enterprise_domain: ?[]const u8) !void {
-    var device_flow = try provider_login.startGitHubCopilotDeviceFlow(allocator, enterprise_domain);
-    defer provider_login.freeDeviceCodeFlow(allocator, &device_flow);
-
-    try println("", .{});
-    try println("Complete device login:", .{});
-    try println("  URL:  {s}", .{device_flow.verification_uri});
-    try println("  Code: {s}", .{device_flow.user_code});
-    try println("Waiting for authorization...", .{});
-
-    const device_access = try provider_login.pollGitHubCopilotDeviceAccessToken(
-        allocator,
-        device_flow.device_code,
-        device_flow.interval_seconds,
-        device_flow.expires_in_seconds,
-        enterprise_domain,
-    );
-    defer allocator.free(device_access);
-
-    var creds = try provider_login.refreshGitHubCopilotToken(allocator, device_access, enterprise_domain);
-    defer provider_login.freeOAuthCredentials(allocator, &creds);
-
-    try saveFromProviderLoginCredentials(allocator, .github_copilot, creds);
+    try oauth_registry.savePiOAuthCredentials(allocator, provider_name, tokens);
 }
 
 fn printSavedPath(allocator: std.mem.Allocator) void {
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
     defer allocator.free(home);
 
-    const path = provider_oauth.piAuthPathFromHome(allocator, home) orelse return;
+    const path = oauth_registry.piAuthPathFromHome(allocator, home) orelse return;
     defer allocator.free(path);
 
     std.log.info("Saved OAuth credentials to {s}", .{path});
@@ -285,11 +213,13 @@ pub fn main() !void {
     }
 
     switch (provider) {
-        .openai_codex, .openai_codex_spark => try runOpenAICodexFlow(allocator, provider),
-        .anthropic => try runAnthropicFlow(allocator),
-        .google_gemini_cli => try runGoogleGeminiCliFlow(allocator),
-        .google_antigravity => try runGoogleAntigravityFlow(allocator),
-        .github_copilot => try runGithubCopilotFlow(allocator, enterprise_domain),
+        .openai_codex,
+        .openai_codex_spark,
+        .anthropic,
+        .google_gemini_cli,
+        .google_antigravity,
+        .github_copilot,
+        => try runOAuthFlow(allocator, provider, enterprise_domain),
     }
 
     printSavedPath(allocator);
