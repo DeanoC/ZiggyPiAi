@@ -532,13 +532,20 @@ fn hasAssistantMessageContent(msg: types.Message) bool {
 }
 
 fn appendBedrockAssistantThinkingBlock(
+    allocator: std.mem.Allocator,
     writer: anytype,
     block: types.ThinkingContent,
 ) !bool {
     if (block.redacted) {
         if (block.signature) |signature| {
             try writer.writeAll("{\"reasoningContent\":{\"redactedContent\":");
-            try writeJson(writer, signature);
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch null;
+            defer if (parsed) |*value| value.deinit();
+            if (parsed) |value| {
+                try writeJson(writer, value.value);
+            } else {
+                try writeJson(writer, signature);
+            }
             try writer.writeAll("}}");
             return true;
         }
@@ -963,7 +970,7 @@ fn buildConverseBody(
                             const can_write = value.redacted or value.signature != null or value.thinking.len > 0;
                             if (!can_write) break :blk false;
                             if (wrote_any) try body.writer().writeByte(',');
-                            if (!try appendBedrockAssistantThinkingBlock(body.writer(), value)) break :blk false;
+                            if (!try appendBedrockAssistantThinkingBlock(allocator, body.writer(), value)) break :blk false;
                             break :blk true;
                         },
                         .image => false,
@@ -2072,6 +2079,42 @@ test "bedrock request body replays reasoning content blocks" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoningContent\":{\"reasoningText\":{\"text\":\"chain of thought\",\"signature\":\"sig-456\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoningContent\":{\"redactedContent\":\"opaque-redacted\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"hello\"") != null);
+}
+
+test "bedrock request body preserves structured redacted reasoning payloads" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-sonnet-4-20250514-v1:0",
+        .name = "Claude Sonnet 4",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+    const blocks = [_]types.MessageContent{
+        .{ .thinking = .{
+            .thinking = redacted_reasoning_placeholder,
+            .signature = "{\"blob\":\"opaque-redacted\"}",
+            .redacted = true,
+        } },
+    };
+    const context: types.Context = .{
+        .messages = &.{
+            .{
+                .role = .assistant,
+                .content_blocks = &blocks,
+            },
+        },
+    };
+
+    const body = try buildConverseBody(allocator, model, context, .{});
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoningContent\":{\"redactedContent\":{\"blob\":\"opaque-redacted\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"redactedContent\":\"{\\\"blob\\\":\\\"opaque-redacted\\\"}\"") == null);
 }
 
 test "bedrock request body uses explicit reasoning effort overrides" {
