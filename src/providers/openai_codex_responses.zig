@@ -370,7 +370,9 @@ fn isReasoningItem(
 ) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch return false;
     defer parsed.deinit();
-    return parsed.value == .object;
+    if (parsed.value != .object) return false;
+    const type_v = parsed.value.object.get("type") orelse return false;
+    return type_v == .string and std.mem.eql(u8, type_v.string, "reasoning");
 }
 
 fn splitToolCallId(tool_call_id: []const u8) struct { call_id: []const u8, item_id: ?[]const u8 } {
@@ -1270,4 +1272,49 @@ test "openai responses request replays reasoning items from thinking signatures"
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"reasoning\",\"id\":\"rs_123\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"message\",\"role\":\"assistant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"final answer\"") != null);
+}
+
+test "openai responses request ignores non-openai reasoning signatures" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .cost = .{ .input = 0.0, .output = 0.0 },
+        .context_window = 1_000_000,
+        .max_tokens = 1,
+    };
+    const blocks = [_]types.MessageContent{
+        .{ .thinking = .{
+            .thinking = "[Reasoning redacted]",
+            .signature = "{\"redactedContent\":{\"blob\":\"opaque\"}}",
+            .redacted = true,
+        } },
+        .{ .text = .{ .text = "fallback answer" } },
+    };
+    const messages: []const types.Message = &.{
+        .{
+            .role = .assistant,
+            .content_blocks = &blocks,
+        },
+    };
+    const context: types.Context = .{
+        .messages = messages,
+    };
+
+    const body = try buildResponsesRequestBody(
+        allocator,
+        model,
+        context,
+        .{},
+        "https://api.openai.com/v1/responses",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"redactedContent\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"message\",\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"fallback answer\"") != null);
 }
