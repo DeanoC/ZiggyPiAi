@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
+const payload_hooks = @import("../payload_hooks.zig");
 
 const service_name = "bedrock";
 const authenticated_placeholder = "<authenticated>";
@@ -532,18 +533,43 @@ fn thinkingBudget(reasoning: []const u8) u32 {
     return 8192;
 }
 
+fn resolvedThinkingEffort(options: types.StreamOptions) ?[]const u8 {
+    if (options.reasoning) |reasoning| return mapThinkingEffort(reasoning);
+    if (options.thinking_budget) |budget| {
+        if (budget.level) |level| return switch (level) {
+            .minimal, .low => "low",
+            .medium => "medium",
+            .high, .xhigh => "high",
+        };
+    }
+    return null;
+}
+
+fn resolvedThinkingBudget(options: types.StreamOptions) ?u32 {
+    if (options.thinking_budget) |budget| {
+        if (budget.tokens) |tokens| return tokens;
+        if (budget.level) |level| return switch (level) {
+            .minimal => 1024,
+            .low => 2048,
+            .medium => 8192,
+            .high, .xhigh => 16384,
+        };
+    }
+    if (options.reasoning) |reasoning| return thinkingBudget(reasoning);
+    return null;
+}
+
 fn buildAdditionalModelRequestFields(
     allocator: std.mem.Allocator,
     model: types.Model,
     options: types.StreamOptions,
 ) !?[]const u8 {
-    const reasoning = options.reasoning orelse return null;
     if (!model.reasoning) return null;
     const is_anthropic = std.mem.indexOf(u8, model.id, "anthropic.claude") != null or std.mem.indexOf(u8, model.id, "anthropic/claude") != null;
     if (!is_anthropic) return null;
 
     if (supportsAdaptiveThinking(model.id)) {
-        const effort = mapThinkingEffort(reasoning);
+        const effort = resolvedThinkingEffort(options) orelse return null;
         const out = try std.fmt.allocPrint(
             allocator,
             "{{\"thinking\":{{\"type\":\"adaptive\"}},\"output_config\":{{\"effort\":\"{s}\"}}}}",
@@ -552,10 +578,11 @@ fn buildAdditionalModelRequestFields(
         return out;
     }
 
+    const budget = resolvedThinkingBudget(options) orelse return null;
     const out = try std.fmt.allocPrint(
         allocator,
         "{{\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}},\"anthropic_beta\":[\"interleaved-thinking-2025-05-14\"]}}",
-        .{thinkingBudget(reasoning)},
+        .{budget},
     );
     return out;
 }
@@ -693,12 +720,13 @@ fn appendTextEvent(
     text: []const u8,
     block_index: usize,
     full_text: *std.array_list.Managed(u8),
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     if (text.len == 0) return;
     try events.append(.{ .text_start = block_index });
     try full_text.appendSlice(text);
-    try events.append(.{ .text_delta = .{ .content_index = block_index, .delta = try allocator.dupe(u8, text) } });
+    try payload_hooks.appendTextDelta(allocator, events, options, block_index, text);
     try events.append(.{ .text_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, text) } });
 }
 
@@ -707,12 +735,13 @@ fn appendThinkingEvent(
     text: []const u8,
     block_index: usize,
     full_thinking: *std.array_list.Managed(u8),
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     if (text.len == 0) return;
     try events.append(.{ .thinking_start = block_index });
     try full_thinking.appendSlice(text);
-    try events.append(.{ .thinking_delta = .{ .content_index = block_index, .delta = try allocator.dupe(u8, text) } });
+    try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, text);
     try events.append(.{ .thinking_end = .{ .content_index = block_index, .content = try allocator.dupe(u8, text) } });
 }
 
@@ -791,6 +820,7 @@ fn parseConverseEventStreamResponse(
     allocator: std.mem.Allocator,
     payload: []const u8,
     model: types.Model,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
     var usage: types.Usage = .{};
@@ -868,6 +898,9 @@ fn parseConverseEventStreamResponse(
 
         if (event_type) |kind| {
             const event_payload = payload[payload_start..payload_end];
+            if (event_payload.len > 0 and event_payload[0] == '{') {
+                try payload_hooks.dispatchRawJson(options, event_payload);
+            }
             var parsed_opt = try parseEventPayload(allocator, event_payload);
             defer if (parsed_opt) |*p| p.deinit();
             const root = if (parsed_opt) |p| p.value else std.json.Value{ .null = {} };
@@ -964,10 +997,7 @@ fn parseConverseEventStreamResponse(
                         if (state.?.kind == .text) {
                             try state.?.text.appendSlice(text_v.string);
                             try full_text.appendSlice(text_v.string);
-                            try events.append(.{ .text_delta = .{
-                                .content_index = state.?.content_index,
-                                .delta = try allocator.dupe(u8, text_v.string),
-                            } });
+                            try payload_hooks.appendTextDelta(allocator, events, options, state.?.content_index, text_v.string);
                         }
                     }
                 } else if (delta_v.object.get("reasoningContent")) |reasoning_v| {
@@ -986,10 +1016,7 @@ fn parseConverseEventStreamResponse(
                                 if (state.?.kind == .thinking) {
                                     try state.?.text.appendSlice(text_v.string);
                                     try full_thinking.appendSlice(text_v.string);
-                                    try events.append(.{ .thinking_delta = .{
-                                        .content_index = state.?.content_index,
-                                        .delta = try allocator.dupe(u8, text_v.string),
-                                    } });
+                                    try payload_hooks.appendThinkingDelta(allocator, events, options, state.?.content_index, text_v.string);
                                 }
                             }
                         }
@@ -1004,10 +1031,7 @@ fn parseConverseEventStreamResponse(
                                 };
                                 if (state.kind == .tool) {
                                     try state.text.appendSlice(input_v.string);
-                                    try events.append(.{ .toolcall_delta = .{
-                                        .content_index = state.content_index,
-                                        .delta = try allocator.dupe(u8, input_v.string),
-                                    } });
+                                    try payload_hooks.appendToolCallDelta(allocator, events, options, state.content_index, input_v.string);
                                 }
                             }
                         }
@@ -1092,6 +1116,7 @@ fn parseConverseEventStreamResponse(
                                 if (usageInt(v)) |n| usage.cache_write = n;
                             }
                             types.calculateCost(model, &usage);
+                            try payload_hooks.dispatchUsage(options, usage);
                         }
                     }
                 }
@@ -1117,15 +1142,17 @@ fn parseConverseEventStreamResponse(
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = stop_reason;
-    try events.append(.{ .done = out });
+    try payload_hooks.appendDone(events, options, out);
 }
 
 fn parseConverseResponse(
     allocator: std.mem.Allocator,
     payload: []const u8,
     model: types.Model,
+    options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
+    try payload_hooks.dispatchRawJson(options, payload);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
         try events.append(.{ .err = try allocator.dupe(u8, "Invalid Bedrock JSON response") });
         return;
@@ -1173,6 +1200,7 @@ fn parseConverseResponse(
                 if (v == .integer) usage.cache_write = @intCast(v.integer);
             }
             types.calculateCost(model, &usage);
+            try payload_hooks.dispatchUsage(options, usage);
         }
     }
 
@@ -1195,7 +1223,7 @@ fn parseConverseResponse(
 
                                 if (item.object.get("text")) |text_v| {
                                     if (text_v == .string) {
-                                        try appendTextEvent(allocator, text_v.string, block_index, &full_text, events);
+                                        try appendTextEvent(allocator, text_v.string, block_index, &full_text, options, events);
                                         block_index += 1;
                                     }
                                 }
@@ -1206,7 +1234,7 @@ fn parseConverseResponse(
                                             if (rt_v == .object) {
                                                 if (rt_v.object.get("text")) |t_v| {
                                                     if (t_v == .string) {
-                                                        try appendThinkingEvent(allocator, t_v.string, block_index, &full_thinking, events);
+                                                        try appendThinkingEvent(allocator, t_v.string, block_index, &full_thinking, options, events);
                                                         block_index += 1;
                                                     }
                                                 }
@@ -1227,7 +1255,7 @@ fn parseConverseResponse(
                                         defer allocator.free(args);
 
                                         try events.append(.{ .toolcall_start = block_index });
-                                        try events.append(.{ .toolcall_delta = .{ .content_index = block_index, .delta = try allocator.dupe(u8, args) } });
+                                        try payload_hooks.appendToolCallDelta(allocator, events, options, block_index, args);
 
                                         const tool_call_for_done = types.ToolCall{
                                             .id = try allocator.dupe(u8, id_v.string),
@@ -1259,7 +1287,7 @@ fn parseConverseResponse(
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = stop_reason;
-    try events.append(.{ .done = out });
+    try payload_hooks.appendDone(events, options, out);
 }
 
 pub fn streamBedrockConverseStream(
@@ -1400,9 +1428,9 @@ pub fn streamBedrockConverseStream(
         return;
     }
 
-    parseConverseEventStreamResponse(allocator, response_buf.items, model, events) catch {
+    parseConverseEventStreamResponse(allocator, response_buf.items, model, options, events) catch {
         // Fallback for proxies that transform converse-stream responses into regular JSON.
-        try parseConverseResponse(allocator, response_buf.items, model, events);
+        try parseConverseResponse(allocator, response_buf.items, model, options, events);
     };
 }
 
@@ -1531,7 +1559,7 @@ test "bedrock response parser emits text and tool events" {
         events.deinit();
     }
 
-    try parseConverseResponse(allocator, payload, model, &events);
+    try parseConverseResponse(allocator, payload, model, .{}, &events);
     try std.testing.expect(events.items.len >= 5);
 }
 
@@ -1702,7 +1730,7 @@ test "bedrock eventstream parser emits streaming events" {
         events.deinit();
     }
 
-    try parseConverseEventStreamResponse(allocator, payload.items, model, &events);
+    try parseConverseEventStreamResponse(allocator, payload.items, model, .{}, &events);
     try std.testing.expect(events.items.len >= 4);
     const last = events.items[events.items.len - 1];
     switch (last) {
@@ -1768,7 +1796,7 @@ test "bedrock eventstream parser maps exception events to descriptive errors" {
         events.deinit();
     }
 
-    try parseConverseEventStreamResponse(allocator, f, model, &events);
+    try parseConverseEventStreamResponse(allocator, f, model, .{}, &events);
     try std.testing.expect(events.items.len >= 1);
     switch (events.items[events.items.len - 1]) {
         .err => |msg| try std.testing.expectEqualStrings("Throttling error: too many requests", msg),

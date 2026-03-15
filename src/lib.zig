@@ -2,6 +2,7 @@ pub const types = @import("types.zig");
 pub const api_registry = @import("api_registry.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
 pub const models = @import("models.zig");
+pub const payload_hooks = @import("payload_hooks.zig");
 pub const stream = @import("stream.zig");
 pub const transform_messages = @import("transform_messages.zig");
 pub const oauth = struct {
@@ -24,6 +25,7 @@ test {
     _ = api_registry;
     _ = env_api_keys;
     _ = models;
+    _ = payload_hooks;
     _ = stream;
     _ = transform_messages;
     _ = oauth;

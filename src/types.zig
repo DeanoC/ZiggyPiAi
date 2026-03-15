@@ -72,6 +72,30 @@ pub const Header = struct {
     value: []const u8,
 };
 
+pub const Transport = enum {
+    auto,
+    sse,
+    websocket,
+};
+
+pub const ThinkingLevel = enum {
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+pub const ThinkingBudget = struct {
+    tokens: ?u32 = null,
+    level: ?ThinkingLevel = null,
+};
+
+pub const MetadataEntry = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
@@ -106,17 +130,13 @@ pub const StreamOptions = struct {
     session_id: ?[]const u8 = null,
     text_verbosity: ?[]const u8 = null,
     headers: ?[]const Header = null,
-};
-
-pub const SimpleStreamOptions = struct {
-    temperature: ?f64 = null,
-    max_tokens: ?u32 = null,
-    api_key: ?[]const u8 = null,
-    reasoning: ?[]const u8 = null,
-    reasoning_summary: ?[]const u8 = null,
-    session_id: ?[]const u8 = null,
-    text_verbosity: ?[]const u8 = null,
-    headers: ?[]const Header = null,
+    transport: Transport = .auto,
+    cache_retention: ?[]const u8 = null,
+    max_retry_delay_ms: ?u32 = null,
+    metadata: ?[]const MetadataEntry = null,
+    thinking_budget: ?ThinkingBudget = null,
+    on_payload: ?*const fn (ctx: ?*anyopaque, payload: ProviderPayload) anyerror!void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 pub const Context = struct {
@@ -173,6 +193,15 @@ pub const ThinkingEndEvent = struct {
     content: []const u8,
 };
 
+pub const ProviderPayload = union(enum) {
+    text_delta: TextDeltaEvent,
+    thinking_delta: ThinkingDeltaEvent,
+    tool_call_delta: ToolCallDeltaEvent,
+    usage: Usage,
+    raw_json: []const u8,
+    done,
+};
+
 pub const AssistantMessageEvent = union(enum) {
     start: AssistantMessage,
     text_start: usize,
@@ -215,4 +244,24 @@ test "calculateCost mirrors TS model" {
     calculateCost(model, &usage);
     try std.testing.expectApproxEqAbs(@as(f64, 0.00015), usage.cost.input, 0.000000001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0012), usage.cost.output, 0.000000001);
+}
+
+test "stream options include parity defaults" {
+    const opts: StreamOptions = .{};
+    try std.testing.expect(opts.transport == .auto);
+    try std.testing.expect(opts.cache_retention == null);
+    try std.testing.expect(opts.max_retry_delay_ms == null);
+    try std.testing.expect(opts.metadata == null);
+    try std.testing.expect(opts.thinking_budget == null);
+    try std.testing.expect(opts.on_payload == null);
+    try std.testing.expect(opts.on_payload_ctx == null);
+}
+
+test "thinking budget can use tokens or level" {
+    const level_budget: ThinkingBudget = .{ .level = .high };
+    const token_budget: ThinkingBudget = .{ .tokens = 2048 };
+    try std.testing.expect(level_budget.level == .high);
+    try std.testing.expect(level_budget.tokens == null);
+    try std.testing.expect(token_budget.tokens == 2048);
+    try std.testing.expect(token_budget.level == null);
 }

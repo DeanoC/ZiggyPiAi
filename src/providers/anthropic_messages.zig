@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
+const payload_hooks = @import("../payload_hooks.zig");
 
 fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
@@ -454,6 +455,7 @@ pub fn streamAnthropicMessages(
             const payload = std.mem.trim(u8, frame.items, " ");
             frame.clearRetainingCapacity();
             if (std.mem.eql(u8, payload, "[DONE]")) break;
+            try payload_hooks.dispatchRawJson(options, payload);
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
             defer parsed.deinit();
             const root = parsed.value;
@@ -469,6 +471,9 @@ pub fn streamAnthropicMessages(
                                 if (u.object.get("input_tokens")) |v| {
                                     if (v == .integer) usage.input = @intCast(v.integer);
                                 }
+                                usage.total_tokens = usage.input + usage.output;
+                                types.calculateCost(model, &usage);
+                                try payload_hooks.dispatchUsage(options, usage);
                             }
                         }
                     }
@@ -513,7 +518,7 @@ pub fn streamAnthropicMessages(
                         if (v == .string) {
                             try text_current.appendSlice(v.string);
                             try text_all.appendSlice(v.string);
-                            try events.append(.{ .text_delta = .{ .content_index = idx, .delta = try allocator.dupe(u8, v.string) } });
+                            try payload_hooks.appendTextDelta(allocator, events, options, idx, v.string);
                         }
                     }
                 } else if (kind == .thinking) {
@@ -521,14 +526,14 @@ pub fn streamAnthropicMessages(
                         if (v == .string) {
                             try text_current.appendSlice(v.string);
                             try thinking_all.appendSlice(v.string);
-                            try events.append(.{ .thinking_delta = .{ .content_index = idx, .delta = try allocator.dupe(u8, v.string) } });
+                            try payload_hooks.appendThinkingDelta(allocator, events, options, idx, v.string);
                         }
                     }
                 } else if (kind == .tool) {
                     if (delta.object.get("partial_json")) |v| {
                         if (v == .string) {
                             try current_tool.args.appendSlice(v.string);
-                            try events.append(.{ .toolcall_delta = .{ .content_index = idx, .delta = try allocator.dupe(u8, v.string) } });
+                            try payload_hooks.appendToolCallDelta(allocator, events, options, idx, v.string);
                         }
                     }
                 }
@@ -549,6 +554,7 @@ pub fn streamAnthropicMessages(
                         }
                         usage.total_tokens = usage.input + usage.output;
                         types.calculateCost(model, &usage);
+                        try payload_hooks.dispatchUsage(options, usage);
                     }
                 }
             } else if (std.mem.eql(u8, type_v.string, "message_stop")) {
@@ -580,7 +586,7 @@ pub fn streamAnthropicMessages(
     out.tool_calls = try tool_calls.toOwnedSlice();
     out.usage = usage;
     out.stop_reason = if (out.tool_calls.len > 0 and stop_reason == .stop) .tool_use else stop_reason;
-    try events.append(.{ .done = out });
+    try payload_hooks.appendDone(events, options, out);
 }
 
 test "anthropic stop reason mapping" {

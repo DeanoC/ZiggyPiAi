@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const transform = @import("../transform_messages.zig");
+const payload_hooks = @import("../payload_hooks.zig");
 
 fn writeJson(writer: anytype, value: anytype) !void {
     try std.fmt.format(writer, "{f}", .{std.json.fmt(value, .{})});
@@ -56,6 +57,21 @@ fn appendMessageText(allocator: std.mem.Allocator, msg: types.Message, writer: a
 
 fn generateToolId(allocator: std.mem.Allocator, name: []const u8, index: usize) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, index });
+}
+
+fn mappedThinkingBudget(options: types.StreamOptions) ?u32 {
+    if (options.thinking_budget) |budget| {
+        if (budget.tokens) |tokens| return tokens;
+        if (budget.level) |level| {
+            return switch (level) {
+                .minimal => 1024,
+                .low => 2048,
+                .medium => 8192,
+                .high, .xhigh => 16384,
+            };
+        }
+    }
+    return null;
 }
 
 const antigravity_instruction =
@@ -572,7 +588,7 @@ fn writeGenerateRequestBody(
         try writer.writeAll("]}]");
     }
 
-    if (options.temperature != null or options.max_tokens != null) {
+    if (options.temperature != null or options.max_tokens != null or mappedThinkingBudget(options) != null) {
         try writer.writeAll(",\"generationConfig\":{");
         var wrote = false;
         if (options.temperature) |temp| {
@@ -584,6 +600,13 @@ fn writeGenerateRequestBody(
             if (wrote) try writer.writeByte(',');
             try writer.writeAll("\"maxOutputTokens\":");
             try writer.print("{d}", .{max_tokens});
+            wrote = true;
+        }
+        if (mappedThinkingBudget(options)) |budget_tokens| {
+            if (wrote) try writer.writeByte(',');
+            try writer.writeAll("\"thinkingConfig\":{\"thinkingBudget\":");
+            try writer.print("{d}", .{budget_tokens});
+            try writer.writeByte('}');
         }
         try writer.writeAll("}");
     }
@@ -766,6 +789,7 @@ pub fn streamGoogleGenerativeAI(
             const payload = std.mem.trim(u8, frame.items, " ");
             frame.clearRetainingCapacity();
             if (!std.mem.startsWith(u8, payload, "{")) continue;
+            try payload_hooks.dispatchRawJson(options, payload);
 
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
             defer parsed.deinit();
@@ -784,6 +808,7 @@ pub fn streamGoogleGenerativeAI(
                         if (v == .integer) usage.total_tokens = @intCast(v.integer);
                     }
                     types.calculateCost(model, &usage);
+                    try payload_hooks.dispatchUsage(options, usage);
                 }
             }
 
@@ -811,10 +836,7 @@ pub fn streamGoogleGenerativeAI(
                                                     try events.append(.{ .thinking_start = block_index });
                                                 }
                                                 try thinking.appendSlice(text_v.string);
-                                                try events.append(.{ .thinking_delta = .{
-                                                    .content_index = block_index,
-                                                    .delta = try allocator.dupe(u8, text_v.string),
-                                                } });
+                                                try payload_hooks.appendThinkingDelta(allocator, events, options, block_index, text_v.string);
                                                 continue;
                                             }
                                         }
@@ -824,10 +846,7 @@ pub fn streamGoogleGenerativeAI(
                                             try events.append(.{ .text_start = block_index });
                                         }
                                         try full_text.appendSlice(text_v.string);
-                                        try events.append(.{ .text_delta = .{
-                                            .content_index = block_index,
-                                            .delta = try allocator.dupe(u8, text_v.string),
-                                        } });
+                                        try payload_hooks.appendTextDelta(allocator, events, options, block_index, text_v.string);
                                     }
                                 }
 
@@ -841,10 +860,7 @@ pub fn streamGoogleGenerativeAI(
                                     const tool_id = try generateToolId(allocator, name_v.string, tool_index);
                                     tool_index += 1;
                                     try events.append(.{ .toolcall_start = block_index + tool_calls.items.len + 1 });
-                                    try events.append(.{ .toolcall_delta = .{
-                                        .content_index = block_index + tool_calls.items.len + 1,
-                                        .delta = try allocator.dupe(u8, args_json),
-                                    } });
+                                    try payload_hooks.appendToolCallDelta(allocator, events, options, block_index + tool_calls.items.len + 1, args_json);
                                     const tool_call = types.ToolCall{
                                         .id = tool_id,
                                         .name = try allocator.dupe(u8, name_v.string),
@@ -888,7 +904,7 @@ pub fn streamGoogleGenerativeAI(
     output.tool_calls = try tool_calls.toOwnedSlice();
     output.usage = usage;
     output.stop_reason = stop_reason;
-    try events.append(.{ .done = output });
+    try payload_hooks.appendDone(events, options, output);
 }
 
 test "google stop reason mapping" {
@@ -988,4 +1004,26 @@ test "antigravity instruction wrapper is formatted" {
     defer allocator.free(wrapped);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[ignore]") != null);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[/ignore]") != null);
+}
+
+test "google request body includes thinking budget when configured" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    try writeGenerateRequestBody(
+        allocator,
+        body.writer(),
+        context,
+        .{ .thinking_budget = .{ .level = .medium } },
+        true,
+        false,
+        false,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinkingConfig\":{\"thinkingBudget\":8192}") != null);
 }
