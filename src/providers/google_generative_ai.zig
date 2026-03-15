@@ -148,6 +148,118 @@ fn resolveThinkingConfig(model: types.Model, options: types.StreamOptions) !?Goo
 
 const antigravity_instruction =
     "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
+const default_google_cli_endpoint = "https://cloudcode-pa.googleapis.com";
+const antigravity_daily_endpoint = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const antigravity_autopush_endpoint = "https://autopush-cloudcode-pa.sandbox.googleapis.com";
+const default_antigravity_version = "1.18.4";
+const base_retry_delay_ms: u64 = 1000;
+
+fn resolvedAntigravityConfig(options: types.StreamOptions) types.AntigravityConfig {
+    return options.antigravity orelse .{};
+}
+
+fn resolvedAntigravityClientVersion(
+    config: types.AntigravityConfig,
+    env_override: ?[]const u8,
+) []const u8 {
+    if (config.client_version) |version| {
+        if (version.len > 0) return version;
+    }
+    if (env_override) |version| {
+        if (version.len > 0) return version;
+    }
+    return default_antigravity_version;
+}
+
+fn loadAntigravityClientVersion(
+    allocator: std.mem.Allocator,
+    options: types.StreamOptions,
+) ![]const u8 {
+    const env_override = std.process.getEnvVarOwned(allocator, "PI_AI_ANTIGRAVITY_VERSION") catch null;
+    defer if (env_override) |value| allocator.free(value);
+    return allocator.dupe(u8, resolvedAntigravityClientVersion(resolvedAntigravityConfig(options), env_override));
+}
+
+fn buildAntigravityUserAgent(
+    allocator: std.mem.Allocator,
+    client_version: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "antigravity/{s} darwin/arm64", .{client_version});
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    values: *std.array_list.Managed([]const u8),
+    value: []const u8,
+) !void {
+    for (values.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try values.append(try allocator.dupe(u8, value));
+}
+
+fn deinitOwnedStringList(
+    allocator: std.mem.Allocator,
+    values: *std.array_list.Managed([]const u8),
+) void {
+    for (values.items) |value| allocator.free(value);
+    values.deinit();
+}
+
+fn buildAntigravityEndpoints(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+) !std.array_list.Managed([]const u8) {
+    const config = resolvedAntigravityConfig(options);
+    var endpoints = std.array_list.Managed([]const u8).init(allocator);
+    errdefer deinitOwnedStringList(allocator, &endpoints);
+
+    if (config.base_url) |base_url| {
+        try appendUniqueOwnedString(allocator, &endpoints, base_url);
+        if (config.fallback_base_url) |fallback| {
+            try appendUniqueOwnedString(allocator, &endpoints, fallback);
+        }
+        return endpoints;
+    }
+
+    try appendUniqueOwnedString(allocator, &endpoints, model.base_url);
+    if (config.fallback_base_url) |fallback| {
+        try appendUniqueOwnedString(allocator, &endpoints, fallback);
+        return endpoints;
+    }
+
+    try appendUniqueOwnedString(allocator, &endpoints, antigravity_daily_endpoint);
+    try appendUniqueOwnedString(allocator, &endpoints, antigravity_autopush_endpoint);
+    try appendUniqueOwnedString(allocator, &endpoints, default_google_cli_endpoint);
+    return endpoints;
+}
+
+fn retryDelayMs(options: types.StreamOptions, attempt: usize) u64 {
+    const base_delay = base_retry_delay_ms * (@as(u64, 1) << @intCast(attempt));
+    if (options.max_retry_delay_ms) |cap_ms| {
+        return @min(base_delay, @as(u64, cap_ms));
+    }
+    return base_delay;
+}
+
+fn isAntigravityEndpointFallbackStatus(status: std.http.Status) bool {
+    return status == .forbidden or status == .not_found;
+}
+
+fn isAntigravityRetryableStatus(status: std.http.Status) bool {
+    return status == .too_many_requests or
+        status == .internal_server_error or
+        status == .bad_gateway or
+        status == .service_unavailable or
+        status == .gateway_timeout;
+}
+
+fn needsAntigravityThinkingBetaHeader(model: types.Model) bool {
+    return std.mem.eql(u8, model.provider, "google-antigravity") and
+        std.mem.startsWith(u8, model.id, "claude-") and
+        model.reasoning;
+}
 
 const GoogleCredentials = struct {
     token: []const u8,
@@ -695,148 +807,13 @@ fn writeGenerateRequestBody(
     }
 }
 
-pub fn streamGoogleGenerativeAI(
+fn parseGoogleSseResponse(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
+    sse: []const u8,
     model: types.Model,
-    context: types.Context,
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    const api_key = options.api_key orelse return error.MissingApiKey;
-
-    var endpoint = std.array_list.Managed(u8).init(allocator);
-    defer endpoint.deinit();
-    var body = std.array_list.Managed(u8).init(allocator);
-    defer body.deinit();
-
-    var headers = std.array_list.Managed(std.http.Header).init(allocator);
-    defer headers.deinit();
-    try appendHeader(&headers, "content-type", "application/json");
-    try appendHeader(&headers, "accept", "text/event-stream");
-
-    const base = std.mem.trimRight(u8, model.base_url, "/");
-    if (std.mem.eql(u8, model.api, "google-generative-ai")) {
-        const endpoint_owned = try std.fmt.allocPrint(
-            allocator,
-            "{s}/models/{s}:streamGenerateContent?alt=sse&key={s}",
-            .{ base, model.id, api_key },
-        );
-        defer allocator.free(endpoint_owned);
-        try endpoint.appendSlice(endpoint_owned);
-        try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, true, false, false);
-        try body.writer().writeByte('}');
-    } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
-        var creds = try parseGoogleCredentials(allocator, api_key);
-        defer deinitGoogleCredentials(allocator, &creds);
-        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
-        defer allocator.free(auth);
-        try appendHeader(&headers, "authorization", auth);
-        try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
-        try appendHeader(&headers, "client-metadata", "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}");
-        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
-            try appendHeader(&headers, "user-agent", "antigravity/1.15.8 darwin/arm64");
-            if (containsCaseInsensitive(model.id, "claude") and containsCaseInsensitive(model.id, "thinking")) {
-                try appendHeader(&headers, "anthropic-beta", "interleaved-thinking-2025-05-14");
-            }
-        } else {
-            try appendHeader(&headers, "user-agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
-        }
-
-        const endpoint_owned = try std.fmt.allocPrint(allocator, "{s}/v1internal:streamGenerateContent?alt=sse", .{base});
-        defer allocator.free(endpoint_owned);
-        try endpoint.appendSlice(endpoint_owned);
-
-        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
-        defer allocator.free(project_id);
-
-        const request_id = try std.fmt.allocPrint(allocator, "zig-{d}", .{@as(u64, @intCast(std.time.timestamp()))});
-        defer allocator.free(request_id);
-
-        try body.writer().writeAll("{\"project\":");
-        try writeJson(body.writer(), project_id);
-        try body.writer().writeAll(",\"model\":");
-        try writeJson(body.writer(), model.id);
-        try body.writer().writeAll(",\"request\":{");
-        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, std.mem.eql(u8, model.provider, "google-antigravity"));
-        if (options.session_id) |session_id| {
-            try body.writer().writeAll(",\"sessionId\":");
-            try writeJson(body.writer(), session_id);
-        }
-        try body.writer().writeByte('}');
-        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
-            try body.writer().writeAll(",\"requestType\":\"agent\"");
-        }
-        try body.writer().writeAll(",\"userAgent\":\"ziggypiai\"");
-        try body.writer().writeAll(",\"requestId\":");
-        try writeJson(body.writer(), request_id);
-        try body.writer().writeByte('}');
-    } else if (std.mem.eql(u8, model.api, "google-vertex")) {
-        var creds = if (isAuthenticatedPlaceholder(api_key))
-            (try resolveVertexAdcCredentials(allocator, client) orelse {
-                try events.append(.{ .err = try allocator.dupe(u8, "GOOGLE_VERTEX_API_KEY/OAuth token missing and ADC token exchange failed. Ensure GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC authorized_user credentials are configured.") });
-                return;
-            })
-        else
-            try parseGoogleCredentials(allocator, api_key);
-        defer deinitGoogleCredentials(allocator, &creds);
-        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
-        defer allocator.free(auth);
-        try appendHeader(&headers, "authorization", auth);
-
-        const location = try resolveVertexLocation(allocator);
-        defer allocator.free(location);
-        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
-        defer allocator.free(project_id);
-        const host = if (std.mem.indexOf(u8, model.base_url, "{location}") != null)
-            try std.mem.replaceOwned(u8, allocator, model.base_url, "{location}", location)
-        else
-            try allocator.dupe(u8, model.base_url);
-        defer allocator.free(host);
-        const host_trimmed = std.mem.trimRight(u8, host, "/");
-        const endpoint_owned = try std.fmt.allocPrint(
-            allocator,
-            "{s}/v1/projects/{s}/locations/{s}/publishers/google/models/{s}:streamGenerateContent?alt=sse",
-            .{ host_trimmed, project_id, location, model.id },
-        );
-        defer allocator.free(endpoint_owned);
-        try endpoint.appendSlice(endpoint_owned);
-        try body.writer().writeByte('{');
-        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, false);
-        try body.writer().writeByte('}');
-    } else {
-        return error.ProviderNotSupported;
-    }
-
-    if (options.headers) |custom_headers| {
-        for (custom_headers) |h| try appendHeader(&headers, h.name, h.value);
-    }
-
-    var req = try client.request(.POST, try std.Uri.parse(endpoint.items), .{
-        .extra_headers = headers.items,
-    });
-    defer req.deinit();
-    try req.sendBodyComplete(body.items);
-
-    var redirect_buf: [4096]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status != .ok) {
-        var err_buf = std.array_list.Managed(u8).init(allocator);
-        defer err_buf.deinit();
-        var transfer_buffer: [8192]u8 = undefined;
-        const err_reader = response.reader(&transfer_buffer);
-        try readAllResponseBody(err_reader, &err_buf);
-        try events.append(.{ .err = try allocator.dupe(u8, err_buf.items) });
-        return;
-    }
-
-    var sse = std.array_list.Managed(u8).init(allocator);
-    defer sse.deinit();
-    var transfer_buffer: [8192]u8 = undefined;
-    const response_reader = response.reader(&transfer_buffer);
-    try readAllResponseBody(response_reader, &sse);
-
     var usage: types.Usage = .{};
     var stop_reason: types.StopReason = .stop;
     var output = types.AssistantMessage{
@@ -864,7 +841,7 @@ pub fn streamGoogleGenerativeAI(
     var saw_thinking = false;
     var tool_index: usize = 0;
 
-    var lines = std.mem.splitScalar(u8, sse.items, '\n');
+    var lines = std.mem.splitScalar(u8, sse, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimRight(u8, raw, "\r");
         if (line.len == 0) {
@@ -990,6 +967,204 @@ pub fn streamGoogleGenerativeAI(
     try payload_hooks.appendDone(events, options, output);
 }
 
+pub fn streamGoogleGenerativeAI(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    model: types.Model,
+    context: types.Context,
+    options: types.StreamOptions,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    const api_key = options.api_key orelse return error.MissingApiKey;
+
+    var endpoint = std.array_list.Managed(u8).init(allocator);
+    defer endpoint.deinit();
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var antigravity_endpoints: ?std.array_list.Managed([]const u8) = null;
+    defer if (antigravity_endpoints) |*values| deinitOwnedStringList(allocator, values);
+
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try appendHeader(&headers, "content-type", "application/json");
+    try appendHeader(&headers, "accept", "text/event-stream");
+
+    const base = std.mem.trimRight(u8, model.base_url, "/");
+    if (std.mem.eql(u8, model.api, "google-generative-ai")) {
+        const endpoint_owned = try std.fmt.allocPrint(
+            allocator,
+            "{s}/models/{s}:streamGenerateContent?alt=sse&key={s}",
+            .{ base, model.id, api_key },
+        );
+        defer allocator.free(endpoint_owned);
+        try endpoint.appendSlice(endpoint_owned);
+        try body.writer().writeByte('{');
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, true, false, false);
+        try body.writer().writeByte('}');
+    } else if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
+        const is_antigravity = std.mem.eql(u8, model.provider, "google-antigravity");
+        var creds = try parseGoogleCredentials(allocator, api_key);
+        defer deinitGoogleCredentials(allocator, &creds);
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
+        defer allocator.free(auth);
+        try appendHeader(&headers, "authorization", auth);
+        try appendHeader(&headers, "x-goog-api-client", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+        try appendHeader(&headers, "client-metadata", "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}");
+        if (is_antigravity) {
+            antigravity_endpoints = try buildAntigravityEndpoints(allocator, model, options);
+            const client_version = try loadAntigravityClientVersion(allocator, options);
+            defer allocator.free(client_version);
+            const user_agent = try buildAntigravityUserAgent(allocator, client_version);
+            defer allocator.free(user_agent);
+            try appendHeader(&headers, "user-agent", user_agent);
+            if (needsAntigravityThinkingBetaHeader(model)) {
+                try appendHeader(&headers, "anthropic-beta", "interleaved-thinking-2025-05-14");
+            }
+        } else {
+            try appendHeader(&headers, "user-agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+            const endpoint_owned = try std.fmt.allocPrint(allocator, "{s}/v1internal:streamGenerateContent?alt=sse", .{base});
+            defer allocator.free(endpoint_owned);
+            try endpoint.appendSlice(endpoint_owned);
+        }
+
+        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
+        defer allocator.free(project_id);
+
+        const request_id = try std.fmt.allocPrint(allocator, "zig-{d}", .{@as(u64, @intCast(std.time.timestamp()))});
+        defer allocator.free(request_id);
+
+        try body.writer().writeAll("{\"project\":");
+        try writeJson(body.writer(), project_id);
+        try body.writer().writeAll(",\"model\":");
+        try writeJson(body.writer(), model.id);
+        try body.writer().writeAll(",\"request\":{");
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, std.mem.eql(u8, model.provider, "google-antigravity"));
+        if (options.session_id) |session_id| {
+            try body.writer().writeAll(",\"sessionId\":");
+            try writeJson(body.writer(), session_id);
+        }
+        try body.writer().writeByte('}');
+        if (std.mem.eql(u8, model.provider, "google-antigravity")) {
+            try body.writer().writeAll(",\"requestType\":\"agent\"");
+        }
+        try body.writer().writeAll(",\"userAgent\":\"ziggypiai\"");
+        try body.writer().writeAll(",\"requestId\":");
+        try writeJson(body.writer(), request_id);
+        try body.writer().writeByte('}');
+    } else if (std.mem.eql(u8, model.api, "google-vertex")) {
+        var creds = if (isAuthenticatedPlaceholder(api_key))
+            (try resolveVertexAdcCredentials(allocator, client) orelse {
+                try events.append(.{ .err = try allocator.dupe(u8, "GOOGLE_VERTEX_API_KEY/OAuth token missing and ADC token exchange failed. Ensure GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC authorized_user credentials are configured.") });
+                return;
+            })
+        else
+            try parseGoogleCredentials(allocator, api_key);
+        defer deinitGoogleCredentials(allocator, &creds);
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{creds.token});
+        defer allocator.free(auth);
+        try appendHeader(&headers, "authorization", auth);
+
+        const location = try resolveVertexLocation(allocator);
+        defer allocator.free(location);
+        const project_id = try resolveProjectId(allocator, creds) orelse return error.MissingProjectId;
+        defer allocator.free(project_id);
+        const host = if (std.mem.indexOf(u8, model.base_url, "{location}") != null)
+            try std.mem.replaceOwned(u8, allocator, model.base_url, "{location}", location)
+        else
+            try allocator.dupe(u8, model.base_url);
+        defer allocator.free(host);
+        const host_trimmed = std.mem.trimRight(u8, host, "/");
+        const endpoint_owned = try std.fmt.allocPrint(
+            allocator,
+            "{s}/v1/projects/{s}/locations/{s}/publishers/google/models/{s}:streamGenerateContent?alt=sse",
+            .{ host_trimmed, project_id, location, model.id },
+        );
+        defer allocator.free(endpoint_owned);
+        try endpoint.appendSlice(endpoint_owned);
+        try body.writer().writeByte('{');
+        try writeGenerateRequestBody(allocator, body.writer(), model, context, options, false, true, false);
+        try body.writer().writeByte('}');
+    } else {
+        return error.ProviderNotSupported;
+    }
+
+    if (options.headers) |custom_headers| {
+        for (custom_headers) |h| try appendHeader(&headers, h.name, h.value);
+    }
+
+    var sse = std.array_list.Managed(u8).init(allocator);
+    defer sse.deinit();
+
+    if (antigravity_endpoints) |*endpoints| {
+        var endpoint_index: usize = 0;
+        var attempt: usize = 0;
+        while (true) {
+            const request_url = try std.fmt.allocPrint(
+                allocator,
+                "{s}/v1internal:streamGenerateContent?alt=sse",
+                .{endpoints.items[endpoint_index]},
+            );
+            defer allocator.free(request_url);
+
+            var req = try client.request(.POST, try std.Uri.parse(request_url), .{
+                .extra_headers = headers.items,
+            });
+            defer req.deinit();
+            try req.sendBodyComplete(body.items);
+
+            var redirect_buf: [4096]u8 = undefined;
+            var response = try req.receiveHead(&redirect_buf);
+            sse.clearRetainingCapacity();
+            var transfer_buffer: [8192]u8 = undefined;
+            const response_reader = response.reader(&transfer_buffer);
+            try readAllResponseBody(response_reader, &sse);
+
+            if (response.head.status == .ok) break;
+
+            if (isAntigravityEndpointFallbackStatus(response.head.status) and endpoint_index + 1 < endpoints.items.len) {
+                endpoint_index += 1;
+                continue;
+            }
+
+            if (isAntigravityRetryableStatus(response.head.status) and attempt < 3) {
+                if (endpoint_index + 1 < endpoints.items.len) {
+                    endpoint_index += 1;
+                }
+                std.Thread.sleep(retryDelayMs(options, attempt) * std.time.ns_per_ms);
+                attempt += 1;
+                continue;
+            }
+
+            try events.append(.{ .err = try allocator.dupe(u8, sse.items) });
+            return;
+        }
+    } else {
+        var req = try client.request(.POST, try std.Uri.parse(endpoint.items), .{
+            .extra_headers = headers.items,
+        });
+        defer req.deinit();
+        try req.sendBodyComplete(body.items);
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+        if (response.head.status != .ok) {
+            var err_buf = std.array_list.Managed(u8).init(allocator);
+            defer err_buf.deinit();
+            var transfer_buffer: [8192]u8 = undefined;
+            const err_reader = response.reader(&transfer_buffer);
+            try readAllResponseBody(err_reader, &err_buf);
+            try events.append(.{ .err = try allocator.dupe(u8, err_buf.items) });
+            return;
+        }
+
+        var transfer_buffer: [8192]u8 = undefined;
+        const response_reader = response.reader(&transfer_buffer);
+        try readAllResponseBody(response_reader, &sse);
+    }
+
+    try parseGoogleSseResponse(allocator, sse.items, model, options, events);
+}
+
 test "google stop reason mapping" {
     try std.testing.expect(mapGoogleStopReason("STOP") == .stop);
     try std.testing.expect(mapGoogleStopReason("MAX_TOKENS") == .length);
@@ -1087,6 +1262,83 @@ test "antigravity instruction wrapper is formatted" {
     defer allocator.free(wrapped);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[ignore]") != null);
     try std.testing.expect(std.mem.indexOf(u8, wrapped, "[/ignore]") != null);
+}
+
+test "antigravity client version prefers config override" {
+    try std.testing.expectEqualStrings(
+        "2.0.0",
+        resolvedAntigravityClientVersion(.{ .client_version = "2.0.0" }, "1.18.4"),
+    );
+    try std.testing.expectEqualStrings(
+        "1.18.4",
+        resolvedAntigravityClientVersion(.{}, "1.18.4"),
+    );
+    try std.testing.expectEqualStrings(
+        default_antigravity_version,
+        resolvedAntigravityClientVersion(.{}, null),
+    );
+}
+
+test "antigravity endpoint list matches upstream fallback order" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "claude-opus-4-5-thinking",
+        .name = "Claude Opus 4.5 Thinking (Antigravity)",
+        .api = "google-gemini-cli",
+        .provider = "google-antigravity",
+        .base_url = antigravity_daily_endpoint,
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 64_000,
+    };
+
+    var endpoints = try buildAntigravityEndpoints(allocator, model, .{});
+    defer deinitOwnedStringList(allocator, &endpoints);
+
+    try std.testing.expectEqual(@as(usize, 3), endpoints.items.len);
+    try std.testing.expectEqualStrings(antigravity_daily_endpoint, endpoints.items[0]);
+    try std.testing.expectEqualStrings(antigravity_autopush_endpoint, endpoints.items[1]);
+    try std.testing.expectEqualStrings(default_google_cli_endpoint, endpoints.items[2]);
+}
+
+test "antigravity explicit endpoints override built-in fallback chain" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "claude-opus-4-5-thinking",
+        .name = "Claude Opus 4.5 Thinking (Antigravity)",
+        .api = "google-gemini-cli",
+        .provider = "google-antigravity",
+        .base_url = antigravity_daily_endpoint,
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 64_000,
+    };
+
+    var endpoints = try buildAntigravityEndpoints(
+        allocator,
+        model,
+        .{
+            .antigravity = .{
+                .base_url = "https://custom-antigravity.example.com",
+                .fallback_base_url = "https://backup-antigravity.example.com",
+            },
+        },
+    );
+    defer deinitOwnedStringList(allocator, &endpoints);
+
+    try std.testing.expectEqual(@as(usize, 2), endpoints.items.len);
+    try std.testing.expectEqualStrings("https://custom-antigravity.example.com", endpoints.items[0]);
+    try std.testing.expectEqualStrings("https://backup-antigravity.example.com", endpoints.items[1]);
+}
+
+test "antigravity fallback status classification is explicit" {
+    try std.testing.expect(isAntigravityEndpointFallbackStatus(.forbidden));
+    try std.testing.expect(isAntigravityEndpointFallbackStatus(.not_found));
+    try std.testing.expect(isAntigravityRetryableStatus(.too_many_requests));
+    try std.testing.expect(isAntigravityRetryableStatus(.service_unavailable));
+    try std.testing.expect(!isAntigravityRetryableStatus(.bad_request));
 }
 
 test "google request body includes thinking budget when configured" {

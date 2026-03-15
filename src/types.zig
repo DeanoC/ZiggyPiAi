@@ -115,6 +115,12 @@ pub const BedrockOptions = struct {
     interleaved_thinking: ?bool = null,
 };
 
+pub const AntigravityConfig = struct {
+    base_url: ?[]const u8 = null,
+    fallback_base_url: ?[]const u8 = null,
+    client_version: ?[]const u8 = null,
+};
+
 pub const MetadataEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -161,6 +167,7 @@ pub const StreamOptions = struct {
     thinking_budget: ?ThinkingBudget = null,
     gemini_thinking: ?GeminiThinking = null,
     bedrock: ?BedrockOptions = null,
+    antigravity: ?AntigravityConfig = null,
     on_payload: ?*const fn (ctx: ?*anyopaque, payload: ProviderPayload) anyerror!void = null,
     on_payload_ctx: ?*anyopaque = null,
 };
@@ -281,6 +288,7 @@ test "stream options include parity defaults" {
     try std.testing.expect(opts.thinking_budget == null);
     try std.testing.expect(opts.gemini_thinking == null);
     try std.testing.expect(opts.bedrock == null);
+    try std.testing.expect(opts.antigravity == null);
     try std.testing.expect(opts.on_payload == null);
     try std.testing.expect(opts.on_payload_ctx == null);
 }
@@ -320,4 +328,16 @@ test "bedrock options support provider-specific overrides" {
     try std.testing.expect(bedrock.reasoning.?.effort.? == .high);
     try std.testing.expectEqual(@as(u32, 4096), bedrock.thinking_budget.?.tokens.?);
     try std.testing.expectEqual(true, bedrock.interleaved_thinking.?);
+}
+
+test "antigravity config supports endpoint and version overrides" {
+    const antigravity: AntigravityConfig = .{
+        .base_url = "https://daily-cloudcode-pa.sandbox.googleapis.com",
+        .fallback_base_url = "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+        .client_version = "1.18.4",
+    };
+
+    try std.testing.expectEqualStrings("https://daily-cloudcode-pa.sandbox.googleapis.com", antigravity.base_url.?);
+    try std.testing.expectEqualStrings("https://autopush-cloudcode-pa.sandbox.googleapis.com", antigravity.fallback_base_url.?);
+    try std.testing.expectEqualStrings("1.18.4", antigravity.client_version.?);
 }

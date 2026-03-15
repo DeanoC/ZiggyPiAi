@@ -55,6 +55,22 @@ Validation notes:
 - Gemini-specific level mode is validated against Gemini 3 models before request emission
 - unsupported Gemini 3 Pro levels fail early instead of sending contradictory JSON
 
+## Antigravity Endpoint Controls
+
+Antigravity requests now support `StreamOptions.antigravity` for endpoint and client-version overrides:
+
+- `base_url` overrides the primary Cloud Code Assist endpoint
+- `fallback_base_url` provides an explicit secondary endpoint
+- `client_version` controls the Antigravity user-agent version string
+
+Behavior notes:
+
+- if no explicit endpoints are set, Antigravity uses the upstream fallback chain:
+  `daily-cloudcode-pa.sandbox.googleapis.com -> autopush-cloudcode-pa.sandbox.googleapis.com -> cloudcode-pa.googleapis.com`
+- `PI_AI_ANTIGRAVITY_VERSION` overrides the default client version when `StreamOptions.antigravity.client_version` is not set
+- `403` and `404` responses immediately advance to the next configured endpoint
+- `429` and `5xx` responses retry with capped exponential backoff and also advance through the endpoint chain when possible
+
 ## Bedrock Advanced Controls
 
 Bedrock requests now support a provider-specific override block on `StreamOptions.bedrock`:
