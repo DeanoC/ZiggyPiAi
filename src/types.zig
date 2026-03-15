@@ -96,6 +96,25 @@ pub const GeminiThinking = union(enum) {
     level: ThinkingLevel,
 };
 
+pub const ToolChoice = union(enum) {
+    auto,
+    any,
+    tool: []const u8,
+};
+
+pub const ReasoningOptions = struct {
+    effort: ?ThinkingLevel = null,
+};
+
+pub const BedrockOptions = struct {
+    region: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    tool_choice: ?ToolChoice = null,
+    reasoning: ?ReasoningOptions = null,
+    thinking_budget: ?ThinkingBudget = null,
+    interleaved_thinking: ?bool = null,
+};
+
 pub const MetadataEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -141,6 +160,7 @@ pub const StreamOptions = struct {
     metadata: ?[]const MetadataEntry = null,
     thinking_budget: ?ThinkingBudget = null,
     gemini_thinking: ?GeminiThinking = null,
+    bedrock: ?BedrockOptions = null,
     on_payload: ?*const fn (ctx: ?*anyopaque, payload: ProviderPayload) anyerror!void = null,
     on_payload_ctx: ?*anyopaque = null,
 };
@@ -260,6 +280,7 @@ test "stream options include parity defaults" {
     try std.testing.expect(opts.metadata == null);
     try std.testing.expect(opts.thinking_budget == null);
     try std.testing.expect(opts.gemini_thinking == null);
+    try std.testing.expect(opts.bedrock == null);
     try std.testing.expect(opts.on_payload == null);
     try std.testing.expect(opts.on_payload_ctx == null);
 }
@@ -280,4 +301,23 @@ test "gemini thinking can use budget tokens or level" {
     try std.testing.expect(level_thinking.level == .medium);
     try std.testing.expect(budget_thinking == .budget_tokens);
     try std.testing.expectEqual(@as(u32, 4096), budget_thinking.budget_tokens);
+}
+
+test "bedrock options support provider-specific overrides" {
+    const bedrock: BedrockOptions = .{
+        .region = "us-west-2",
+        .profile = "dev",
+        .tool_choice = .{ .tool = "get_weather" },
+        .reasoning = .{ .effort = .high },
+        .thinking_budget = .{ .tokens = 4096 },
+        .interleaved_thinking = true,
+    };
+
+    try std.testing.expectEqualStrings("us-west-2", bedrock.region.?);
+    try std.testing.expectEqualStrings("dev", bedrock.profile.?);
+    try std.testing.expect(bedrock.tool_choice.? == .tool);
+    try std.testing.expectEqualStrings("get_weather", bedrock.tool_choice.?.tool);
+    try std.testing.expect(bedrock.reasoning.?.effort.? == .high);
+    try std.testing.expectEqual(@as(u32, 4096), bedrock.thinking_budget.?.tokens.?);
+    try std.testing.expectEqual(true, bedrock.interleaved_thinking.?);
 }

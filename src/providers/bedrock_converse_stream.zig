@@ -518,6 +518,32 @@ fn supportsAdaptiveThinking(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "opus-4-6") != null or std.mem.indexOf(u8, model_id, "opus-4.6") != null;
 }
 
+fn isAnthropicBedrockModel(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "anthropic.claude") != null or std.mem.indexOf(u8, model_id, "anthropic/claude") != null;
+}
+
+fn supportsInterleavedThinking(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "claude-opus-4") != null or std.mem.indexOf(u8, model_id, "claude-sonnet-4") != null;
+}
+
+fn hasThinkingBudgetValue(thinking_budget: ?types.ThinkingBudget) bool {
+    if (thinking_budget) |budget| {
+        return budget.tokens != null or budget.level != null;
+    }
+    return false;
+}
+
+fn hasReasoningEffortValue(reasoning: ?types.ReasoningOptions) bool {
+    if (reasoning) |cfg| {
+        return cfg.effort != null;
+    }
+    return false;
+}
+
+fn resolvedBedrockOptions(options: types.StreamOptions) types.BedrockOptions {
+    return options.bedrock orelse .{};
+}
+
 fn mapThinkingEffort(reasoning: []const u8) []const u8 {
     if (std.mem.eql(u8, reasoning, "minimal") or std.mem.eql(u8, reasoning, "low")) return "low";
     if (std.mem.eql(u8, reasoning, "medium")) return "medium";
@@ -534,6 +560,25 @@ fn thinkingBudget(reasoning: []const u8) u32 {
 }
 
 fn resolvedThinkingEffort(options: types.StreamOptions) ?[]const u8 {
+    const bedrock = resolvedBedrockOptions(options);
+    if (bedrock.reasoning) |reasoning| {
+        if (reasoning.effort) |effort| {
+            return switch (effort) {
+                .minimal, .low => "low",
+                .medium => "medium",
+                .high, .xhigh => "high",
+            };
+        }
+    }
+    if (bedrock.thinking_budget) |budget| {
+        if (budget.level) |level| {
+            return switch (level) {
+                .minimal, .low => "low",
+                .medium => "medium",
+                .high, .xhigh => "high",
+            };
+        }
+    }
     if (options.reasoning) |reasoning| return mapThinkingEffort(reasoning);
     if (options.thinking_budget) |budget| {
         if (budget.level) |level| return switch (level) {
@@ -546,6 +591,16 @@ fn resolvedThinkingEffort(options: types.StreamOptions) ?[]const u8 {
 }
 
 fn resolvedThinkingBudget(options: types.StreamOptions) ?u32 {
+    const bedrock = resolvedBedrockOptions(options);
+    if (bedrock.thinking_budget) |budget| {
+        if (budget.tokens) |tokens| return tokens;
+        if (budget.level) |level| return switch (level) {
+            .minimal => 1024,
+            .low => 2048,
+            .medium => 8192,
+            .high, .xhigh => 16384,
+        };
+    }
     if (options.thinking_budget) |budget| {
         if (budget.tokens) |tokens| return tokens;
         if (budget.level) |level| return switch (level) {
@@ -559,32 +614,216 @@ fn resolvedThinkingBudget(options: types.StreamOptions) ?u32 {
     return null;
 }
 
-fn buildAdditionalModelRequestFields(
-    allocator: std.mem.Allocator,
+const BedrockBudgetThinkingSettings = struct {
+    tokens: u32,
+    interleaved: bool,
+};
+
+const BedrockThinkingSettings = union(enum) {
+    adaptive: []const u8,
+    budget: BedrockBudgetThinkingSettings,
+};
+
+fn resolveBedrockThinkingSettings(
     model: types.Model,
     options: types.StreamOptions,
-) !?[]const u8 {
-    if (!model.reasoning) return null;
-    const is_anthropic = std.mem.indexOf(u8, model.id, "anthropic.claude") != null or std.mem.indexOf(u8, model.id, "anthropic/claude") != null;
-    if (!is_anthropic) return null;
+) !?BedrockThinkingSettings {
+    const bedrock = resolvedBedrockOptions(options);
+    const explicit_reasoning = hasReasoningEffortValue(bedrock.reasoning);
+    const explicit_budget = hasThinkingBudgetValue(bedrock.thinking_budget);
+    const explicit_interleaved = bedrock.interleaved_thinking != null;
+
+    if (!model.reasoning or !isAnthropicBedrockModel(model.id)) {
+        if (explicit_reasoning or explicit_budget or explicit_interleaved) {
+            return error.InvalidBedrockReasoningConfiguration;
+        }
+        return null;
+    }
+
+    if (explicit_reasoning and explicit_budget) {
+        return error.InvalidBedrockReasoningConfiguration;
+    }
 
     if (supportsAdaptiveThinking(model.id)) {
+        if (explicit_budget and bedrock.thinking_budget.?.tokens != null) {
+            return error.InvalidBedrockReasoningConfiguration;
+        }
+        if (explicit_interleaved and bedrock.interleaved_thinking.?) {
+            return error.InvalidBedrockReasoningConfiguration;
+        }
+
         const effort = resolvedThinkingEffort(options) orelse return null;
-        const out = try std.fmt.allocPrint(
+        return .{ .adaptive = effort };
+    }
+
+    if (explicit_reasoning) {
+        return error.InvalidBedrockReasoningConfiguration;
+    }
+
+    const budget = resolvedThinkingBudget(options) orelse {
+        if (explicit_interleaved and bedrock.interleaved_thinking.?) {
+            return error.InvalidBedrockReasoningConfiguration;
+        }
+        return null;
+    };
+
+    const interleaved = if (bedrock.interleaved_thinking) |value| value else true;
+    if (interleaved and !supportsInterleavedThinking(model.id)) {
+        return error.InvalidBedrockReasoningConfiguration;
+    }
+
+    return .{
+        .budget = .{
+            .tokens = budget,
+            .interleaved = interleaved,
+        },
+    };
+}
+
+fn buildAdditionalModelRequestFields(
+    allocator: std.mem.Allocator,
+    thinking_settings: ?BedrockThinkingSettings,
+) !?[]const u8 {
+    const settings = thinking_settings orelse return null;
+    return switch (settings) {
+        .adaptive => |effort| try std.fmt.allocPrint(
             allocator,
             "{{\"thinking\":{{\"type\":\"adaptive\"}},\"output_config\":{{\"effort\":\"{s}\"}}}}",
             .{effort},
-        );
-        return out;
+        ),
+        .budget => |budget| if (budget.interleaved)
+            try std.fmt.allocPrint(
+                allocator,
+                "{{\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}},\"anthropic_beta\":[\"interleaved-thinking-2025-05-14\"]}}",
+                .{budget.tokens},
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{{\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}}}",
+                .{budget.tokens},
+            ),
+    };
+}
+
+fn appendRequestMetadata(
+    writer: anytype,
+    metadata: []const types.MetadataEntry,
+) !void {
+    if (metadata.len == 0) return;
+    try writer.writeAll(",\"requestMetadata\":{");
+    for (metadata, 0..) |entry, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeJson(writer, entry.key);
+        try writer.writeByte(':');
+        try writeJson(writer, entry.value);
+    }
+    try writer.writeByte('}');
+}
+
+fn findToolByName(tools: []const types.Tool, name: []const u8) bool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return true;
+    }
+    return false;
+}
+
+fn appendToolChoice(
+    writer: anytype,
+    tool_choice: types.ToolChoice,
+) !void {
+    try writer.writeAll(",\"toolChoice\":");
+    switch (tool_choice) {
+        .auto => try writer.writeAll("{\"auto\":{}}"),
+        .any => try writer.writeAll("{\"any\":{}}"),
+        .tool => |name| {
+            try writer.writeAll("{\"tool\":{\"name\":");
+            try writeJson(writer, name);
+            try writer.writeAll("}}");
+        },
+    }
+}
+
+fn resolvedToolChoice(
+    model: types.Model,
+    context: types.Context,
+    options: types.StreamOptions,
+    thinking_settings: ?BedrockThinkingSettings,
+) !?types.ToolChoice {
+    const bedrock = resolvedBedrockOptions(options);
+    const tool_choice = bedrock.tool_choice orelse return null;
+    const tools = context.tools orelse return error.InvalidBedrockToolChoiceConfiguration;
+    if (tools.len == 0) return error.InvalidBedrockToolChoiceConfiguration;
+
+    switch (tool_choice) {
+        .tool => |name| {
+            if (name.len == 0 or !findToolByName(tools, name)) {
+                return error.InvalidBedrockToolChoiceConfiguration;
+            }
+        },
+        else => {},
     }
 
-    const budget = resolvedThinkingBudget(options) orelse return null;
-    const out = try std.fmt.allocPrint(
+    if (thinking_settings != null) {
+        switch (tool_choice) {
+            .any, .tool => {
+                if (isAnthropicBedrockModel(model.id)) {
+                    return error.InvalidBedrockToolChoiceConfiguration;
+                }
+            },
+            .auto => {},
+        }
+    }
+
+    return tool_choice;
+}
+
+fn applyRegionToBaseUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    region: []const u8,
+) ![]const u8 {
+    const uri = std.Uri.parse(base_url) catch return allocator.dupe(u8, base_url);
+    var host_buf: [256]u8 = undefined;
+    const host = uri.getHost(&host_buf) catch return allocator.dupe(u8, base_url);
+    if (!std.mem.startsWith(u8, host, "bedrock-runtime.")) return allocator.dupe(u8, base_url);
+
+    const first_dot = std.mem.indexOfScalar(u8, host, '.') orelse return allocator.dupe(u8, base_url);
+    const second_dot = std.mem.indexOfPos(u8, host, first_dot + 1, ".") orelse return allocator.dupe(u8, base_url);
+    const host_start = std.mem.indexOf(u8, base_url, host) orelse return allocator.dupe(u8, base_url);
+    const host_end = host_start + host.len;
+    const rewritten_host = try std.fmt.allocPrint(allocator, "bedrock-runtime.{s}{s}", .{ region, host[second_dot..] });
+    defer allocator.free(rewritten_host);
+
+    return std.fmt.allocPrint(
         allocator,
-        "{{\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}},\"anthropic_beta\":[\"interleaved-thinking-2025-05-14\"]}}",
-        .{budget},
+        "{s}{s}{s}",
+        .{ base_url[0..host_start], rewritten_host, base_url[host_end..] },
     );
-    return out;
+}
+
+fn resolveConfiguredRegion(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+    env_region: ?[]const u8,
+    credentials_region: ?[]const u8,
+) ![]const u8 {
+    const bedrock = resolvedBedrockOptions(options);
+    if (bedrock.region) |region| return allocator.dupe(u8, region);
+    if (env_region) |region| return allocator.dupe(u8, region);
+    if (credentials_region) |region| return allocator.dupe(u8, region);
+    return deriveRegionFromBaseUrl(allocator, model.base_url);
+}
+
+fn resolveCredentialProfileName(
+    options: types.StreamOptions,
+    env_profile: ?[]const u8,
+) []const u8 {
+    const bedrock = resolvedBedrockOptions(options);
+    if (bedrock.profile) |profile| return profile;
+    if (env_profile) |profile| return profile;
+    return "default";
 }
 
 fn buildConverseBody(
@@ -595,6 +834,8 @@ fn buildConverseBody(
 ) ![]const u8 {
     var body = std.array_list.Managed(u8).init(allocator);
     errdefer body.deinit();
+    const thinking_settings = try resolveBedrockThinkingSettings(model, options);
+    const tool_choice = try resolvedToolChoice(model, context, options, thinking_settings);
 
     try body.writer().writeAll("{\"messages\":[");
 
@@ -690,13 +931,18 @@ fn buildConverseBody(
         try body.writer().writeAll("}");
     }
 
-    if (try buildAdditionalModelRequestFields(allocator, model, options)) |additional_fields| {
+    if (try buildAdditionalModelRequestFields(allocator, thinking_settings)) |additional_fields| {
         defer allocator.free(additional_fields);
         try body.writer().writeAll(",\"additionalModelRequestFields\":");
         try body.writer().writeAll(additional_fields);
     }
 
-    if (context.tools) |tools| {
+    if (options.metadata) |metadata| {
+        try appendRequestMetadata(body.writer(), metadata);
+    }
+
+    if (context.tools != null or tool_choice != null) {
+        const tools = context.tools orelse return error.InvalidBedrockToolChoiceConfiguration;
         try body.writer().writeAll(",\"toolConfig\":{\"tools\":[");
         for (tools, 0..) |tool, tool_i| {
             if (tool_i > 0) try body.writer().writeByte(',');
@@ -708,7 +954,11 @@ fn buildConverseBody(
             try body.writer().writeAll(tool.parameters_json);
             try body.writer().writeAll("}}}");
         }
-        try body.writer().writeAll("]}");
+        try body.writer().writeByte(']');
+        if (tool_choice) |choice| {
+            try appendToolChoice(body.writer(), choice);
+        }
+        try body.writer().writeByte('}');
     }
 
     try body.writer().writeAll("}");
@@ -1314,13 +1564,6 @@ pub fn streamBedrockConverseStream(
     options: types.StreamOptions,
     events: *std.array_list.Managed(types.AssistantMessageEvent),
 ) !void {
-    const endpoint = try std.fmt.allocPrint(
-        allocator,
-        "{s}/model/{s}/converse-stream",
-        .{ std.mem.trimRight(u8, model.base_url, "/"), model.id },
-    );
-    defer allocator.free(endpoint);
-
     const body = try buildConverseBody(allocator, model, context, options);
     defer allocator.free(body);
 
@@ -1347,7 +1590,7 @@ pub fn streamBedrockConverseStream(
     var shared_credentials: ?AwsCredentialsOwned = null;
     defer if (shared_credentials) |*creds| creds.deinit(allocator);
     if (!use_bearer and (aws_access_key_id == null or aws_secret_access_key == null)) {
-        shared_credentials = try loadAwsCredentialsFromProfile(allocator, aws_profile orelse "default");
+        shared_credentials = try loadAwsCredentialsFromProfile(allocator, resolveCredentialProfileName(options, aws_profile));
         if (shared_credentials == null) {
             shared_credentials = try loadAwsCredentialsFromContainer(allocator, client);
         }
@@ -1355,6 +1598,25 @@ pub fn streamBedrockConverseStream(
             shared_credentials = try loadAwsCredentialsFromWebIdentity(allocator, client);
         }
     }
+
+    const configured_region = try resolveConfiguredRegion(
+        allocator,
+        model,
+        options,
+        aws_region,
+        if (shared_credentials) |creds| creds.region else null,
+    );
+    defer allocator.free(configured_region);
+
+    const base_url = try applyRegionToBaseUrl(allocator, model.base_url, configured_region);
+    defer allocator.free(base_url);
+
+    const endpoint = try std.fmt.allocPrint(
+        allocator,
+        "{s}/model/{s}/converse-stream",
+        .{ std.mem.trimRight(u8, base_url, "/"), model.id },
+    );
+    defer allocator.free(endpoint);
 
     var sigv4_auth_buf: [1024]u8 = undefined;
     var sigv4_amz_date_buf: [16]u8 = undefined;
@@ -1385,13 +1647,6 @@ pub fn streamBedrockConverseStream(
             creds.session_token
         else
             null;
-        const region_owned = if (aws_region) |region|
-            try allocator.dupe(u8, region)
-        else if (shared_credentials) |creds|
-            if (creds.region) |r| try allocator.dupe(u8, r) else try deriveRegionFromBaseUrl(allocator, model.base_url)
-        else
-            try deriveRegionFromBaseUrl(allocator, model.base_url);
-        defer allocator.free(region_owned);
 
         const now_ts: u64 = @intCast(std.time.timestamp());
         const sigv4 = try buildSigV4Authorization(
@@ -1404,7 +1659,7 @@ pub fn streamBedrockConverseStream(
             sig_access,
             sig_secret,
             sig_session,
-            region_owned,
+            configured_region,
             now_ts,
         );
         try appendHeader(&headers, "authorization", sigv4.authorization);
@@ -1521,6 +1776,159 @@ test "bedrock request body batches tool results and sanitizes ids" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"toolUseId\":\"bad_id_1\"") != null);
 }
 
+test "bedrock request body includes tool choice and request metadata" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "amazon.nova-pro-v1:0",
+        .name = "Nova Pro",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = false,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 300_000,
+        .max_tokens = 8_192,
+    };
+
+    const tools = [_]types.Tool{
+        .{
+            .name = "sum",
+            .description = "Add numbers",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"}}}",
+        },
+    };
+    const metadata = [_]types.MetadataEntry{
+        .{ .key = "trace_id", .value = "abc123" },
+    };
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "hello" },
+    };
+    const context: types.Context = .{
+        .messages = &messages,
+        .tools = &tools,
+    };
+
+    const body = try buildConverseBody(
+        allocator,
+        model,
+        context,
+        .{
+            .metadata = &metadata,
+            .bedrock = .{ .tool_choice = .{ .tool = "sum" } },
+        },
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"requestMetadata\":{\"trace_id\":\"abc123\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"toolChoice\":{\"tool\":{\"name\":\"sum\"}}") != null);
+}
+
+test "bedrock request body uses explicit reasoning effort overrides" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-opus-4-6-v1",
+        .name = "Claude Opus 4.6",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 128_000,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    const body = try buildConverseBody(
+        allocator,
+        model,
+        context,
+        .{ .bedrock = .{ .reasoning = .{ .effort = .medium } } },
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"adaptive\"}") != null);
+}
+
+test "bedrock request body disables interleaved thinking when requested" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-sonnet-4-20250514-v1:0",
+        .name = "Claude Sonnet 4",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+    };
+
+    const body = try buildConverseBody(
+        allocator,
+        model,
+        context,
+        .{
+            .bedrock = .{
+                .thinking_budget = .{ .tokens = 4096 },
+                .interleaved_thinking = false,
+            },
+        },
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"anthropic_beta\"") == null);
+}
+
+test "bedrock request body rejects forced tool choice with thinking" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-sonnet-4-20250514-v1:0",
+        .name = "Claude Sonnet 4",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const tools = [_]types.Tool{
+        .{
+            .name = "sum",
+            .description = "Add numbers",
+        },
+    };
+    const context: types.Context = .{
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+        .tools = &tools,
+    };
+
+    try std.testing.expectError(
+        error.InvalidBedrockToolChoiceConfiguration,
+        buildConverseBody(
+            allocator,
+            model,
+            context,
+            .{
+                .bedrock = .{
+                    .tool_choice = .any,
+                    .thinking_budget = .{ .tokens = 4096 },
+                },
+            },
+        ),
+    );
+}
+
 test "bedrock response parser emits text and tool events" {
     const allocator = std.testing.allocator;
     const model: types.Model = .{
@@ -1581,6 +1989,53 @@ test "bedrock region derivation from base url" {
     const derived = try deriveRegionFromBaseUrl(allocator, "https://bedrock-runtime.us-west-2.amazonaws.com");
     defer allocator.free(derived);
     try std.testing.expectEqualStrings("us-west-2", derived);
+}
+
+test "bedrock region rewrite updates runtime host" {
+    const allocator = std.testing.allocator;
+    const rewritten = try applyRegionToBaseUrl(allocator, "https://bedrock-runtime.us-east-1.amazonaws.com", "eu-west-1");
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings("https://bedrock-runtime.eu-west-1.amazonaws.com", rewritten);
+}
+
+test "bedrock region resolution prefers explicit override" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "amazon.nova-pro-v1:0",
+        .name = "Nova Pro",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = false,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 300_000,
+        .max_tokens = 8_192,
+    };
+
+    const region = try resolveConfiguredRegion(
+        allocator,
+        model,
+        .{ .bedrock = .{ .region = "ap-southeast-2" } },
+        "us-west-2",
+        "eu-west-1",
+    );
+    defer allocator.free(region);
+    try std.testing.expectEqualStrings("ap-southeast-2", region);
+}
+
+test "bedrock profile resolution prefers explicit override" {
+    try std.testing.expectEqualStrings(
+        "dev",
+        resolveCredentialProfileName(.{ .bedrock = .{ .profile = "dev" } }, "staging"),
+    );
+    try std.testing.expectEqualStrings(
+        "staging",
+        resolveCredentialProfileName(.{}, "staging"),
+    );
+    try std.testing.expectEqualStrings(
+        "default",
+        resolveCredentialProfileName(.{}, null),
+    );
 }
 
 test "bedrock ini parser reads profile keys" {

@@ -55,6 +55,22 @@ Validation notes:
 - Gemini-specific level mode is validated against Gemini 3 models before request emission
 - unsupported Gemini 3 Pro levels fail early instead of sending contradictory JSON
 
+## Bedrock Advanced Controls
+
+Bedrock requests now support a provider-specific override block on `StreamOptions.bedrock`:
+
+- `region` rewrites the Bedrock runtime host and the SigV4 signing region together
+- `profile` overrides `AWS_PROFILE` for shared-credentials lookup
+- `tool_choice` emits `toolConfig.toolChoice`
+- `reasoning` and `thinking_budget` provide Bedrock-specific overrides ahead of the generic compatibility fields
+- `interleaved_thinking` controls the Anthropic Bedrock beta flag when budget-based thinking is enabled
+
+Behavior notes:
+
+- shared `StreamOptions.metadata` is serialized as Bedrock `requestMetadata`
+- forcing a tool (`tool_choice = .any` or `.tool`) is rejected when Anthropic extended thinking is active
+- explicit Bedrock reasoning overrides fail early on unsupported model families instead of being silently ignored
+
 ### OAuth Registry
 
 The OAuth surface is now routed through `src/oauth/registry.zig`.
