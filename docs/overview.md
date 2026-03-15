@@ -38,6 +38,23 @@ It demonstrates:
 - Kimi routes use `KIMICODE_API_KEY` with `KIMI_API_KEY` / `ANTHROPIC_API_KEY` fallbacks.
 - Azure OpenAI uses `AZURE_OPENAI_API_KEY`.
 
+## Gemini Thinking Controls
+
+Google/Gemini requests support both the generic cross-provider thinking budget and a Gemini-specific override:
+
+- `StreamOptions.thinking_budget`
+  - continues to work for token-budget style requests
+  - for Gemini 3 models, `thinking_budget.level` maps to `thinkingConfig.thinkingLevel`
+- `StreamOptions.gemini_thinking`
+  - `budget_tokens` emits `thinkingConfig.thinkingBudget`
+  - `level` emits `thinkingConfig.thinkingLevel`
+
+Validation notes:
+
+- `gemini_thinking` and `thinking_budget` cannot be set at the same time
+- Gemini-specific level mode is validated against Gemini 3 models before request emission
+- unsupported Gemini 3 Pro levels fail early instead of sending contradictory JSON
+
 ### OAuth Registry
 
 The OAuth surface is now routed through `src/oauth/registry.zig`.
