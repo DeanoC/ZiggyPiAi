@@ -1290,6 +1290,22 @@ fn parseConverseResponse(
     try payload_hooks.appendDone(events, options, out);
 }
 
+fn parseConverseResponseWithFallback(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    model: types.Model,
+    options: types.StreamOptions,
+    events: *std.array_list.Managed(types.AssistantMessageEvent),
+) !void {
+    parseConverseEventStreamResponse(allocator, payload, model, options, events) catch |err| switch (err) {
+        error.InvalidBedrockEventStream => {
+            // Some proxies unwrap converse-stream responses into regular JSON bodies.
+            try parseConverseResponse(allocator, payload, model, options, events);
+        },
+        else => return err,
+    };
+}
+
 pub fn streamBedrockConverseStream(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -1428,10 +1444,7 @@ pub fn streamBedrockConverseStream(
         return;
     }
 
-    parseConverseEventStreamResponse(allocator, response_buf.items, model, options, events) catch {
-        // Fallback for proxies that transform converse-stream responses into regular JSON.
-        try parseConverseResponse(allocator, response_buf.items, model, options, events);
-    };
+    try parseConverseResponseWithFallback(allocator, response_buf.items, model, options, events);
 }
 
 test "bedrock stop reason mapping" {
@@ -1802,4 +1815,139 @@ test "bedrock eventstream parser maps exception events to descriptive errors" {
         .err => |msg| try std.testing.expectEqualStrings("Throttling error: too many requests", msg),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "bedrock converse response fallback parses regular json bodies" {
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const payload =
+        \\{"output":{"message":{"content":[{"text":"hello"}]}},"usage":{"inputTokens":1,"outputTokens":2,"totalTokens":3}}
+    ;
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |v| allocator.free(v.delta),
+                .text_end => |v| allocator.free(v.content),
+                .thinking_delta => |v| allocator.free(v.delta),
+                .thinking_end => |v| allocator.free(v.content),
+                .toolcall_delta => |v| allocator.free(v.delta),
+                .toolcall_end => |v| {
+                    allocator.free(v.tool_call.id);
+                    allocator.free(v.tool_call.name);
+                    allocator.free(v.tool_call.arguments_json);
+                },
+                .done => |v| {
+                    allocator.free(v.text);
+                    allocator.free(v.thinking);
+                    for (v.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    allocator.free(v.tool_calls);
+                },
+                .err => |v| allocator.free(v),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try parseConverseResponseWithFallback(allocator, payload, model, .{}, &events);
+    try std.testing.expect(events.items.len >= 2);
+    switch (events.items[events.items.len - 1]) {
+        .done => |msg| {
+            try std.testing.expectEqualStrings("hello", msg.text);
+            try std.testing.expectEqual(@as(u32, 1), msg.usage.input);
+            try std.testing.expectEqual(@as(u32, 2), msg.usage.output);
+            try std.testing.expectEqual(@as(u32, 3), msg.usage.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "bedrock converse fallback preserves payload hook failures" {
+    const Capture = struct {
+        fn failOnTextDelta(_: ?*anyopaque, payload: types.ProviderPayload) !void {
+            if (payload == .text_delta) return error.PayloadHookFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const model: types.Model = .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Sonnet 3.7",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .cost = .{ .input = 0, .output = 0 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
+    };
+
+    const frame_start = try buildEventStreamFrame(allocator, "messageStart", "{}");
+    defer allocator.free(frame_start);
+    const frame_delta = try buildEventStreamFrame(
+        allocator,
+        "contentBlockDelta",
+        "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"hello\"}}",
+    );
+    defer allocator.free(frame_delta);
+
+    var payload = std.array_list.Managed(u8).init(allocator);
+    defer payload.deinit();
+    try payload.appendSlice(frame_start);
+    try payload.appendSlice(frame_delta);
+
+    var events = std.array_list.Managed(types.AssistantMessageEvent).init(allocator);
+    defer {
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |v| allocator.free(v.delta),
+                .text_end => |v| allocator.free(v.content),
+                .thinking_delta => |v| allocator.free(v.delta),
+                .thinking_end => |v| allocator.free(v.content),
+                .toolcall_delta => |v| allocator.free(v.delta),
+                .toolcall_end => |v| {
+                    allocator.free(v.tool_call.id);
+                    allocator.free(v.tool_call.name);
+                    allocator.free(v.tool_call.arguments_json);
+                },
+                .done => |v| {
+                    allocator.free(v.text);
+                    allocator.free(v.thinking);
+                    for (v.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments_json);
+                    }
+                    allocator.free(v.tool_calls);
+                },
+                .err => |v| allocator.free(v),
+                else => {},
+            }
+        }
+        events.deinit();
+    }
+
+    try std.testing.expectError(error.PayloadHookFailed, parseConverseResponseWithFallback(allocator, payload.items, model, .{
+        .on_payload = Capture.failOnTextDelta,
+    }, &events));
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expect(events.items[0] == .start);
+    try std.testing.expect(events.items[1] == .text_start);
 }
